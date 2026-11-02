@@ -77,6 +77,9 @@ If a person or company that owns rights to training data or related content requ
 
 However, due to my personal circumstances, the confirmation of contact may be delayed, and as a result, the response may be somewhat slow. 
 
+Email:slopcoder20@gmail.com
+
+
 ## LLM assistance
 
 A substantial portion of this project's custom code and modifications was written with assistance from large language models (LLMs). This statement concerns project-specific work; upstream projects retain their original authorship, copyright and license notices. Review the code and test it independently on your own hardware and games.
