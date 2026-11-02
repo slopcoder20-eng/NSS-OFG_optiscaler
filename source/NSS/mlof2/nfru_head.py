@@ -14,7 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 from model_v2 import warp
 
-ARM_WEIGHTS = "/home/sh/neural-graphics-model-gym/tests/usecases/nfru/weights/nfru_v1_fp32.pt"
+ARM_WEIGHTS = "/home/##/neural-graphics-model-gym/tests/usecases/nfru/weights/nfru_v1_fp32.pt"
 
 
 class ConvBlock(nn.Module):
