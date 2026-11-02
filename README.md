@@ -75,8 +75,7 @@ NoAI is a content-specific restriction; this statement does not claim that every
 
 If a person or company that owns rights to training data or related content requests removal, the maintainers will take down the affected model files and releases from the distribution channels they control, and will take down the repository where necessary to honor that request. Rights holders may contact the maintainers through the repository or their GitHub contact information. This commitment does not replace license compliance or grant permission to use someone else's content.
 
-However, delays may occur if you haven't been able to contact them due to personal reasons. 
-
+However, due to my personal circumstances, the confirmation of contact may be delayed, and as a result, the response may be somewhat slow. 
 
 ## LLM assistance
 
