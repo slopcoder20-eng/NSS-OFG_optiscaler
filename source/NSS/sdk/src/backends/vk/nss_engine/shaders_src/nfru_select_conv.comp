@@ -1,0 +1,67 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "nfru_select_common.h"
+                                                                                                    
+layout(constant_id = 0) const uint COUT = 32u;
+layout(constant_id = 1) const uint CIN1 = 32u;
+layout(constant_id = 2) const uint CIN2 = 0u;
+layout(constant_id = 3) const uint STRIDE = 1u;
+layout(constant_id = 4) const uint RELU = 1u;
+layout(set = 0, binding = 0, std430) readonly buffer In1 { float in1[]; };
+layout(set = 0, binding = 1, std430) readonly buffer In2 { float in2[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Out { float outv[]; };
+                                                                                                                    
+const uint COUTP = (COUT + 3u) / 4u * 4u;
+layout(set = 0, binding = 3, std140) uniform Wt { vec4 wt4[4096]; };
+                                                                                                                                                                             
+                                                                                               
+const uint CIN = CIN1 + CIN2;
+const uint T = 7u * STRIDE + 3u;                                         
+const uint TT = T * T + 1u;                                                               
+shared float tile[CIN * TT];
+void main()
+{
+    const uvec2 g = gl_WorkGroupID.xy * 8u, l = gl_LocalInvocationID.xy;
+    const int ox = int(g.x * STRIDE) - 1, oy = int(g.y * STRIDE) - 1;                                   
+    const uint lin = l.y * 8u + l.x;
+    for (uint i = lin; i < T * T * CIN1; i += 64u) {
+        const uint pos = i / CIN1, c = i - pos * CIN1;
+        const int ix = ox + int(pos % T), iy = oy + int(pos / T);
+        const bool inside = ix >= 0 && iy >= 0 && ix < int(pc.iw) && iy < int(pc.ih);
+        tile[c * TT + pos] = inside ? in1[(uint(iy) * pc.iw + uint(ix)) * CIN1 + c] : 0.0;
+    }
+    if (CIN2 != 0u) {                                                                                      
+        for (uint i = lin; i < T * T * CIN2; i += 64u) {
+            const uint pos = i / CIN2, c = i - pos * CIN2;
+            const int ix = ox + int(pos % T), iy = oy + int(pos / T);
+            float v = 0.0;
+            if (ix >= 0 && iy >= 0 && ix < int(pc.iw) && iy < int(pc.ih)) {
+                uint x0, x1, y0, y1; float lx, ly;
+                nfruLinear(uint(ix), pc.iw, pc.iw2, x0, x1, lx);
+                nfruLinear(uint(iy), pc.ih, pc.ih2, y0, y1, ly);
+                v = mix(mix(in2[(y0 * pc.iw2 + x0) * CIN2 + c], in2[(y0 * pc.iw2 + x1) * CIN2 + c], lx),
+                        mix(in2[(y1 * pc.iw2 + x0) * CIN2 + c], in2[(y1 * pc.iw2 + x1) * CIN2 + c], lx), ly);
+            }
+            tile[(CIN1 + c) * TT + pos] = v;
+        }
+    }
+    barrier();
+    const uvec2 p = g + l;
+    if (p.x >= pc.w || p.y >= pc.h) return;
+    const uint bofs = CIN * 9u * COUTP / 4u;
+    float acc[COUTP];
+    for (uint o = 0u; o < COUTP / 4u; ++o) { const vec4 b = wt4[bofs + o]; acc[o * 4u] = b.x; acc[o * 4u + 1u] = b.y; acc[o * 4u + 2u] = b.z; acc[o * 4u + 3u] = b.w; }
+    const uint base = l.y * STRIDE * T + l.x * STRIDE;
+    for (uint c = 0u; c < CIN; ++c)
+        for (uint t = 0u; t < 9u; ++t) {
+            const float v = tile[c * TT + base + (t / 3u) * T + (t % 3u)];
+            const uint wb = (c * 9u + t) * COUTP / 4u;
+            for (uint o = 0u; o < COUTP / 4u; ++o) {
+                const vec4 w = wt4[wb + o];
+                acc[o * 4u] += v * w.x; acc[o * 4u + 1u] += v * w.y; acc[o * 4u + 2u] += v * w.z; acc[o * 4u + 3u] += v * w.w;
+            }
+        }
+    const uint ob = (p.y * pc.w + p.x) * COUT;
+    for (uint o = 0u; o < COUT; ++o) outv[ob + o] = RELU != 0u ? max(acc[o], 0.0) : acc[o];
+}

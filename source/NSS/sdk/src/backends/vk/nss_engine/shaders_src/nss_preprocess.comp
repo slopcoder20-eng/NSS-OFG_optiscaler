@@ -1,0 +1,100 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform PreprocessPC {
+    uint render_width;
+    uint render_height;
+    uint display_width;
+    uint display_height;
+    float jitter_x;
+    float jitter_y;
+    float pre_exposure;
+    int reset_history;
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2D s_in_color;
+layout(set = 0, binding = 1) uniform sampler2D s_in_depth;
+layout(set = 0, binding = 2) uniform sampler2D s_in_mvec;
+layout(set = 0, binding = 3) uniform sampler2D s_history_color;
+
+layout(std430, set = 0, binding = 4) writeonly buffer PreprocessTensorOut {
+    uint out_tensor[];                                                       
+};
+
+                          
+vec3 rgb_to_ycocg(vec3 c) {
+    float y  =  0.25 * c.r + 0.50 * c.g + 0.25 * c.b;
+    float co =  0.50 * c.r              - 0.50 * c.b;
+    float cg = -0.25 * c.r + 0.50 * c.g - 0.25 * c.b;
+    return vec3(y, co, cg);
+}
+
+int quantize_s8(float v, float scale) {
+    int q = int(round(v * scale));
+    return clamp(q, -128, 127);
+}
+
+uint pack_s8x4(int c0, int c1, int c2, int c3) {
+    return (uint(c0) & 0xFFu) |
+           ((uint(c1) & 0xFFu) << 8) |
+           ((uint(c2) & 0xFFu) << 16) |
+           ((uint(c3) & 0xFFu) << 24);
+}
+
+void main() {
+    uvec2 pixel_coord = gl_GlobalInvocationID.xy;
+    if (pixel_coord.x >= pc.render_width || pixel_coord.y >= pc.render_height) return;
+
+    vec2 inv_render = vec2(1.0 / float(pc.render_width), 1.0 / float(pc.render_height));
+    vec2 uv = (vec2(pixel_coord) + vec2(0.5)) * inv_render;
+    vec2 unjittered_uv = uv - vec2(pc.jitter_x, pc.jitter_y) * inv_render;
+
+                       
+    vec4 col_raw = texture(s_in_color, uv);
+    vec3 col_rgb = col_raw.rgb * pc.pre_exposure;
+    vec3 cur_ycocg = rgb_to_ycocg(col_rgb);
+
+                                
+    float depth = texture(s_in_depth, uv).r;
+    vec2 mvec = texture(s_in_mvec, uv).rg;
+
+                              
+    vec2 hist_uv = uv + mvec;
+    vec3 hist_rgb = (pc.reset_history != 0) ? col_rgb : texture(s_history_color, hist_uv).rgb;
+    vec3 hist_ycocg = rgb_to_ycocg(hist_rgb);
+
+                                       
+    vec3 diff_ycocg = cur_ycocg - hist_ycocg;
+
+                                                    
+                             
+    int q_y0  = quantize_s8(cur_ycocg.x - 0.5, 127.0);
+    int q_co0 = quantize_s8(cur_ycocg.y, 127.0);
+    int q_cg0 = quantize_s8(cur_ycocg.z, 127.0);
+                  
+    int q_d   = quantize_s8(depth - 0.5, 127.0);
+
+                             
+    int q_y1  = quantize_s8(hist_ycocg.x - 0.5, 127.0);
+    int q_co1 = quantize_s8(hist_ycocg.y, 127.0);
+    int q_cg1 = quantize_s8(hist_ycocg.z, 127.0);
+                             
+    int q_m   = quantize_s8(length(mvec) * 10.0 - 0.5, 127.0);
+
+                           
+    int q_dy  = quantize_s8(diff_ycocg.x * 2.0, 127.0);
+    int q_dco = quantize_s8(diff_ycocg.y * 2.0, 127.0);
+    int q_dcg = quantize_s8(diff_ycocg.z * 2.0, 127.0);
+                                   
+    int q_st  = (pc.reset_history != 0) ? -128 : 127;
+
+                                                 
+    uint p_idx = pixel_coord.y * pc.render_width + pixel_coord.x;
+    uint base_word = p_idx * 3;
+
+    out_tensor[base_word + 0] = pack_s8x4(q_y0, q_co0, q_cg0, q_d);
+    out_tensor[base_word + 1] = pack_s8x4(q_y1, q_co1, q_cg1, q_m);
+    out_tensor[base_word + 2] = pack_s8x4(q_dy, q_dco, q_dcg, q_st);
+}

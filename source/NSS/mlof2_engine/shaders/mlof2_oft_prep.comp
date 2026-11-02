@@ -1,0 +1,121 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+                                                          
+                                                             
+                                                                   
+                                                                                     
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+                                                          
+vec3 sampleRGB_Z(Seg s, int y, int x) {
+    if (x < 0 || y < 0 || x >= int(s.t.w) || y >= int(s.t.h)) return vec3(0.0);
+    uint addr = (s.t.base >> 3u) + uint(y) * s.t.w + uint(x);
+    uvec2 w = ldv2(addr);
+    vec2 rg = unpackHalf2x16(w.x);
+    float b = unpackHalf2x16(w.y).x;
+    return vec3(rg.x, rg.y, b);
+}
+
+                                                  
+vec3 warpColFast(Seg s, float u, float v) {
+    float x0f = floor(u), y0f = floor(v);
+    float ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    int W = int(s.t.w), H = int(s.t.h);
+
+    if (x0 >= 0 && x0 + 1 < W && y0 >= 0 && y0 + 1 < H) {
+        uint row0 = (s.t.base >> 3u) + uint(y0) * s.t.w;
+        uint row1 = row0 + s.t.w;
+        uvec2 w00 = ldv2(row0 + uint(x0));
+        uvec2 w01 = ldv2(row0 + uint(x0 + 1));
+        uvec2 w10 = ldv2(row1 + uint(x0));
+        uvec2 w11 = ldv2(row1 + uint(x0 + 1));
+
+        vec3 p00 = vec3(unpackHalf2x16(w00.x), unpackHalf2x16(w00.y).x);
+        vec3 p01 = vec3(unpackHalf2x16(w01.x), unpackHalf2x16(w01.y).x);
+        vec3 p10 = vec3(unpackHalf2x16(w10.x), unpackHalf2x16(w10.y).x);
+        vec3 p11 = vec3(unpackHalf2x16(w11.x), unpackHalf2x16(w11.y).x);
+
+        return (1.0 - ay) * ((1.0 - ax) * p00 + ax * p01) +
+               ay * ((1.0 - ax) * p10 + ax * p11);
+    }
+
+    vec3 p00 = sampleRGB_Z(s, y0,     x0);
+    vec3 p01 = sampleRGB_Z(s, y0,     x0 + 1);
+    vec3 p10 = sampleRGB_Z(s, y0 + 1, x0);
+    vec3 p11 = sampleRGB_Z(s, y0 + 1, x0 + 1);
+
+    return (1.0 - ay) * ((1.0 - ax) * p00 + ax * p01) +
+           ay * ((1.0 - ax) * p10 + ax * p11);
+}
+
+int q_sym(float val, float inv_scale) {
+    return int(clamp(roundEven(val * inv_scale), -127.0, 127.0));
+}
+
+uint pack4_i8(int q0, int q1, int q2, int q3) {
+    return (uint(q0) & 0xFFu) | ((uint(q1) & 0xFFu) << 8u) |
+           ((uint(q2) & 0xFFu) << 16u) | ((uint(q3) & 0xFFu) << 24u);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                              
+    uint npix = to.w * to.h;
+    if (gid >= npix) return;
+
+    uint w_val = to.w;
+    uint u_oy = gid / w_val;
+    uint u_ox = gid - u_oy * w_val;
+    int oy = int(u_oy);
+    int ox = int(u_ox);
+
+    Seg s_a = segAt(0u);                        
+    Seg s_b = segAt(1u);                        
+    Seg s_fa = segAt(2u);                        
+    Seg s_fb = segAt(3u);                        
+    Seg s_m = segAt(4u);                        
+
+    uint addr_fa = (s_fa.t.base >> 2u) + uint(oy) * s_fa.t.w + uint(ox);
+    uint addr_fb = (s_fb.t.base >> 2u) + uint(oy) * s_fb.t.w + uint(ox);
+    vec2 fa = unpackHalf2x16(arena_u32[addr_fa]);
+    vec2 fb = unpackHalf2x16(arena_u32[addr_fb]);
+
+    vec3 wa = warpColFast(s_a, float(ox) + fa.x, float(oy) + fa.y);
+    vec3 wb = warpColFast(s_b, float(ox) + fb.x, float(oy) + fb.y);
+
+    vec3 ad = abs(wa - wb);
+    float diff = (ad.r + ad.g + ad.b) * (4.0 / 3.0);
+
+    uint addr_m = (s_m.t.base >> 2u) + uint(oy) * s_m.t.w + uint(ox);
+    float m_val = unpackHalf2x16(arena_u32[addr_m]).x;
+    float t_val = fcf(FC_T);
+
+    float inv_scale = opf(0);                              
+
+    int q0  = q_sym(wa.r, inv_scale);
+    int q1  = q_sym(wa.g, inv_scale);
+    int q2  = q_sym(wa.b, inv_scale);
+    int q3  = q_sym(wb.r, inv_scale);
+    int q4  = q_sym(wb.g, inv_scale);
+    int q5  = q_sym(wb.b, inv_scale);
+    int q6  = q_sym(diff, inv_scale);
+    int q7  = q_sym(fa.x * (1.0 / 16.0), inv_scale);
+    int q8  = q_sym(fa.y * (1.0 / 16.0), inv_scale);
+    int q9  = q_sym(fb.x * (1.0 / 16.0), inv_scale);
+    int q10 = q_sym(fb.y * (1.0 / 16.0), inv_scale);
+    int q11 = q_sym(m_val * (1.0 / 4.0), inv_scale);
+    int q12 = q_sym(t_val, inv_scale);
+
+                                                            
+    uint w0 = pack4_i8(q0,  q1,  q2,  q3);
+    uint w1 = pack4_i8(q4,  q5,  q6,  q7);
+    uint w2 = pack4_i8(q8,  q9,  q10, q11);
+    uint w3 = pack4_i8(q12, 0,   0,   0);
+
+    uint addr_out_v4 = (to.base >> 4u) + uint(oy) * to.w + uint(ox);
+    stv4(addr_out_v4, uvec4(w0, w1, w2, w3));
+}

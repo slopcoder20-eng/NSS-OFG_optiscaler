@@ -1,0 +1,27 @@
+#version 450
+                                                                                                            
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint pixels;
+    uint count;                              
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer In0 { uvec4 in0[]; };
+layout(std430, set = 0, binding = 1) readonly buffer In1 { uvec4 in1[]; };
+layout(std430, set = 0, binding = 2) readonly buffer In2 { uvec4 in2[]; };
+layout(std430, set = 0, binding = 3) readonly buffer In3 { uvec4 in3[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer Out { uvec4 outp[]; };
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.pixels * pc.count) return;
+    const uint p = i / pc.count;
+    const uint k = i - p * pc.count;
+    uvec4 v;
+    if (k == 0u) v = in0[p];
+    else if (k == 1u) v = in1[p];
+    else if (k == 2u) v = in2[p];
+    else v = in3[p];
+    outp[i] = v;
+}

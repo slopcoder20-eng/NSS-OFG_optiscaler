@@ -1,0 +1,284 @@
+[
+  {
+    "pass": 0,
+    "source": "ffx_opticalflow_prepare_luma_pass.glsl",
+    "bytes": 4496,
+    "bindings": {
+      "cb": [
+        [
+          "cbOF",
+          2
+        ]
+      ],
+      "srv": [
+        [
+          "r_input_color",
+          0
+        ]
+      ],
+      "uav": [
+        [
+          "rw_optical_flow_input",
+          1
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 1,
+    "source": "ffx_opticalflow_compute_luminance_pyramid_pass.glsl",
+    "bytes": 12564,
+    "bindings": {
+      "cb": [],
+      "srv": [],
+      "uav": [
+        [
+          "rw_optical_flow_input",
+          0
+        ],
+        [
+          "rw_optical_flow_input_level_1",
+          1
+        ],
+        [
+          "rw_optical_flow_input_level_2",
+          2
+        ],
+        [
+          "rw_optical_flow_input_level_3",
+          3
+        ],
+        [
+          "rw_optical_flow_input_level_4",
+          4
+        ],
+        [
+          "rw_optical_flow_input_level_5",
+          5
+        ],
+        [
+          "rw_optical_flow_input_level_6",
+          6
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 2,
+    "source": "ffx_opticalflow_generate_scd_histogram_pass.glsl",
+    "bytes": 4224,
+    "bindings": {
+      "cb": [
+        [
+          "cbOF",
+          2
+        ]
+      ],
+      "srv": [
+        [
+          "r_optical_flow_input",
+          0
+        ]
+      ],
+      "uav": [
+        [
+          "rw_optical_flow_scd_histogram",
+          1
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 3,
+    "source": "ffx_opticalflow_compute_scd_divergence_pass.glsl",
+    "bytes": 9148,
+    "bindings": {
+      "cb": [],
+      "srv": [],
+      "uav": [
+        [
+          "rw_optical_flow_scd_histogram",
+          0
+        ],
+        [
+          "rw_optical_flow_scd_previous_histogram",
+          1
+        ],
+        [
+          "rw_optical_flow_scd_temp",
+          2
+        ],
+        [
+          "rw_optical_flow_scd_output",
+          3
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 4,
+    "source": "ffx_opticalflow_compute_optical_flow_advanced_pass_v5.glsl",
+    "bytes": 19524,
+    "bindings": {
+      "cb": [
+        [
+          "cbOF",
+          4
+        ]
+      ],
+      "srv": [
+        [
+          "r_optical_flow_input",
+          0
+        ],
+        [
+          "r_optical_flow_previous_input",
+          1
+        ]
+      ],
+      "uav": [
+        [
+          "rw_optical_flow",
+          2
+        ],
+        [
+          "rw_optical_flow_scd_output",
+          3
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 5,
+    "source": "ffx_opticalflow_filter_optical_flow_pass_v5.glsl",
+    "bytes": 2540,
+    "bindings": {
+      "cb": [],
+      "srv": [
+        [
+          "r_optical_flow_previous",
+          0
+        ]
+      ],
+      "uav": [
+        [
+          "rw_optical_flow",
+          1
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 6,
+    "source": "ffx_opticalflow_scale_optical_flow_advanced_pass_v5.glsl",
+    "bytes": 9492,
+    "bindings": {
+      "cb": [
+        [
+          "cbOF",
+          5
+        ]
+      ],
+      "srv": [
+        [
+          "r_optical_flow_input",
+          0
+        ],
+        [
+          "r_optical_flow_previous_input",
+          1
+        ],
+        [
+          "r_optical_flow",
+          2
+        ]
+      ],
+      "uav": [
+        [
+          "rw_optical_flow_next_level",
+          3
+        ],
+        [
+          "rw_optical_flow_scd_output",
+          4
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  },
+  {
+    "pass": 7,
+    "source": "convert_forward.comp",
+    "bytes": 1628,
+    "bindings": {
+      "cb": [],
+      "srv": [
+        [
+          "r_optical_flow_previous",
+          0
+        ]
+      ],
+      "uav": [
+        [
+          "rw_nfru_flow",
+          1
+        ]
+      ],
+      "srvbuf": [],
+      "uavbuf": [],
+      "sampler": [],
+      "rtacc": [],
+      "rt": [],
+      "srvtensor": [],
+      "uavtensor": []
+    }
+  }
+]

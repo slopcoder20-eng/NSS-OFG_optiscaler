@@ -1,0 +1,143 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_integer_dot_product : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+
+                                                                                                 
+                                                                                                        
+                                                                            
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_width;
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint in_channels;
+    uint out_channels;
+    int pad_y;
+    int pad_x;
+    int stride_y;
+    int stride_x;
+    int out_zp;
+    int has_table;
+    uint in1_channels;
+    uint upsample;                                                                                                 
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uvec4 in_data[];
+};
+
+                                                                                                
+layout(std430, set = 0, binding = 0) readonly buffer InputBufferWords {
+    uint in_words[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uint out_data[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer WeightBuffer {
+    uint weight_data[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer BiasBuffer {
+    int32_t bias_data[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer MultiplierBuffer {
+    int32_t multiplier_data[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer ShiftBuffer {
+    int32_t shift_data[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer TableBuffer {
+    int8_t table_data[];
+};
+
+layout(std430, set = 0, binding = 7) readonly buffer InputBuffer2 {
+    uvec4 in_data2[];
+};
+
+#define OCT 2
+#define NOC (16 * OCT)
+#define DP4A(a, b) dotPacked4x8EXT(int(a), int(b))
+
+                                                                                                                
+uvec4 loadInPixel(uint y, uint x, uint ic_t, uint ic_tiles) {
+    uint p_in = (pc.upsample != 0u) ? ((y >> 1) * (pc.in_width >> 1) + (x >> 1)) : (y * pc.in_width + x);
+    if (pc.in_channels == 12u) {
+        uint b = p_in * 3u;
+        return uvec4(in_words[b], in_words[b + 1u], in_words[b + 2u], 0u);
+    }
+    if (pc.in1_channels > 0u)
+        { const uint n1 = pc.in1_channels >> 4; const uint n2 = ((pc.in_channels + 15u) >> 4) - n1; const uint p_n = y * pc.in_width + x; return (ic_t < n1) ? in_data[p_in * n1 + ic_t] : in_data2[p_n * n2 + (ic_t - n1)]; }
+    return in_data[p_in * ic_tiles + ic_t];
+}
+
+void main() {
+    const uint p = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    const uint total_out_pixels = pc.out_width * pc.out_height;
+    const bool ok = p < total_out_pixels;
+    const uint oy = ok ? (p / pc.out_width) : 0u;
+    const uint ox = ok ? (p % pc.out_width) : 0u;
+
+    const uint ic_tiles = (pc.in_channels + 15u) / 16u;
+    const uint oc_tiles = (pc.out_channels + 15u) / 16u;
+    const uint oc_base  = gl_WorkGroupID.y * NOC;                                                                
+    const uint nOc      = min(pc.out_channels - oc_base, uint(NOC));                                   
+
+    int32_t acc[NOC];
+    for (uint o = 0; o < NOC; ++o) acc[o] = 0;
+
+    for (int ky = 0; ky < 3; ++ky) {
+        const int iy = int(oy) * pc.stride_y + ky - pc.pad_y;
+        for (int kx = 0; kx < 3; ++kx) {
+            const int ix = int(ox) * pc.stride_x + kx - pc.pad_x;
+            const bool inb = ok && (iy >= 0) && (iy < int(pc.in_height)) && (ix >= 0) && (ix < int(pc.in_width));
+            for (uint ic_t = 0; ic_t < ic_tiles; ++ic_t) {
+                uvec4 v = uvec4(0x80808080u);                                                            
+                if (inb) v = loadInPixel(uint(iy), uint(ix), ic_t, ic_tiles);
+
+                                                                                                      
+                const uint wtile = (((uint(ky) * 3u + uint(kx)) * ic_tiles + ic_t) * oc_tiles + oc_base / 16u) * 64u;
+                [[unroll]] for (uint o = 0; o < NOC; ++o) {
+                    if (o >= nOc) break;
+                    const uint wb = wtile + (o >> 4) * 64u + (o & 15u);
+                    acc[o] += DP4A(v.x, weight_data[wb])
+                            + DP4A(v.y, weight_data[wb + 16u])
+                            + DP4A(v.z, weight_data[wb + 32u])
+                            + DP4A(v.w, weight_data[wb + 48u]);
+                }
+            }
+        }
+    }
+
+    if (!ok) return;
+
+                                                                                                          
+                                                                                  
+    const uint words_per_pixel = pc.out_channels / 4u;
+    [[unroll]] for (uint w = 0; w < NOC / 4u; ++w) {
+        if (w * 4u >= nOc) break;
+        uint packed_word = 0u;
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            const uint o = w * 4u + j;
+            if (o >= nOc) break;
+            const int32_t a = acc[o] + bias_data[oc_base + o];
+            const int32_t shift = shift_data[oc_base + o];
+            int32_t hi, lo;
+            imulExtended(a, multiplier_data[oc_base + o], hi, lo);
+            const int32_t val = ((hi + (1 << (shift - 33))) >> (shift - 32)) + pc.out_zp;
+            int8_t clamped = int8_t(clamp(val, -128, 127));
+            if (pc.has_table != 0) clamped = table_data[uint(int(clamped) + 128)];
+            packed_word |= (uint(clamped) & 0xFFu) << (8u * j);
+        }
+        out_data[p * words_per_pixel + oc_base / 4u + w] = packed_word;
+    }
+}

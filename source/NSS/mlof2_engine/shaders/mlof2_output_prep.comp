@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) buffer Arena { uint data[]; } b_Arena;
+layout(set = 0, binding = 1) uniform writeonly image2D u_Output;
+                                                                                                                
+                                                                                   
+layout(set = 0, binding = 2) uniform sampler2D t_FullColor;
+layout(set = 0, binding = 3) uniform sampler2D t_SceneColor;
+
+layout(push_constant) uniform OutputPC {
+    uint dispW;
+    uint dispH;
+    uint padW;
+    uint padH;
+    uint out_off;
+    uint hudMode;                                                                                   
+} pc;
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    if (gx >= pc.dispW || gy >= pc.dispH) return;
+
+    uint px_idx = gy * pc.padW + gx;
+    uint base_out = (pc.out_off >> 2) + px_idx * 2u;
+    vec2 rg = unpackHalf2x16(b_Arena.data[base_out + 0u]);
+    vec2 ba = unpackHalf2x16(b_Arena.data[base_out + 1u]);
+    vec3 rgb = clamp(vec3(rg.x, rg.y, ba.x), 0.0, 1.0);
+    if (pc.hudMode != 0u) {
+        vec3 fullColor = texelFetch(t_FullColor, ivec2(gx, gy), 0).rgb;
+        vec3 sceneColor = texelFetch(t_SceneColor, ivec2(gx, gy), 0).rgb;
+                                                                                      
+        vec3 tolerance = pc.hudMode == 2u ? abs(sceneColor) * vec3(1.0 / 64.0, 1.0 / 64.0, 1.0 / 32.0) + vec3(1.0 / 255.0)
+                                          : vec3(1.0 / 4096.0);
+        if (any(greaterThan(abs(fullColor - sceneColor), tolerance)))
+            rgb = fullColor;
+    }
+    imageStore(u_Output, ivec2(gx, gy), vec4(rgb, 1.0));
+}

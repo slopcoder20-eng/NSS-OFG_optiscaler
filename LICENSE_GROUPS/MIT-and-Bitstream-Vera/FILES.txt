@@ -1,0 +1,1 @@
+source/OptiScaler/OptiScaler/menu/font/Hack-Regular.ttf

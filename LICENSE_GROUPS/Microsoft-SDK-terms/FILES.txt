@@ -1,0 +1,1 @@
+source/OptiScaler/external/directx_agility_sdk/LICENSE.txt

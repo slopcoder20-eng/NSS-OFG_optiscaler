@@ -1,0 +1,3 @@
+source /home/sh/rocm_env/bin/activate; cd /mnt/e/nss_VK/NSS/mlof2; R=/home/sh/mlof2_runs
+python of_gate.py $R/menc_exp/log.txt v2_of_menc/s1500; echo "gate exit $?"
+python -u train_v2.py --out /tmp/joint_smoke --steps 2000 --smoke 4 --batch 4 --workers 2 --log 1 --stage of --seeded 0 --convex_up 1 --deep16 0 --p_pan 0 --strides 1,2,3,4,6,8 --spring 0.5 --spring_batch 2 --spring_of_w gt_vis=1 --up_full 0 --prop4 0 --enc_deep 1 --enc_fpn 1 --enc_match 1 --recur8 3 --seq_w 1.0 --warmup 200 --train_only pair.rec,enc.menc --lr 1e-4 --distill_w 0.5 --distill_key m8 --init $R/v2_of_menc/s1500.pt 2>&1 | grep -E "trainable|^step|rror|Traceback" | cut -c1-200

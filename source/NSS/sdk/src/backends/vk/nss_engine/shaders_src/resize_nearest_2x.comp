@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_width;
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint channels;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uvec4 in_data[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uvec4 out_data[];
+};
+
+void main() {
+    uint out_p = gl_GlobalInvocationID.x;
+    uint total_out_pixels = pc.out_width * pc.out_height;
+
+    if (out_p >= total_out_pixels) {
+        return;
+    }
+
+    uint oy = out_p / pc.out_width;
+    uint ox = out_p % pc.out_width;
+
+    uint iy = oy / 2;
+    uint ix = ox / 2;
+
+    uint in_p = iy * pc.in_width + ix;
+
+    uint num_vec = pc.channels / 16;
+    uint in_base  = in_p * num_vec;
+    uint out_base = out_p * num_vec;
+
+    for (uint v = 0; v < num_vec; ++v) {
+        out_data[out_base + v] = in_data[in_base + v];
+    }
+}

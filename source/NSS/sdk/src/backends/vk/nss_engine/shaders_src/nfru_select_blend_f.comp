@@ -1,0 +1,34 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "nfru_select_common.h"
+                                                                                                                    
+layout(set = 0, binding = 0, std430) readonly buffer Cand { uint cand[]; };
+layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D outImage;
+layout(set = 0, binding = 3, std430) readonly buffer Logits { float lg[]; };
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.fw || p.y >= pc.fh) return;
+    uint base = (p.y * pc.fw + p.x) * 6u;
+    uint c5_raw = cand[base + 5u];
+    if (c5_raw == 0xffffffffu) return;
+
+    uint x0, x1, y0, y1; float lx, ly;
+    nfruLinear(p.x, pc.fw, pc.w, x0, x1, lx);
+    nfruLinear(p.y, pc.fh, pc.h, y0, y1, ly);
+    const uint t00 = (y0 * pc.iw + x0) * 6u, t01 = (y0 * pc.iw + x1) * 6u;
+    const uint t10 = (y1 * pc.iw + x0) * 6u, t11 = (y1 * pc.iw + x1) * 6u;
+
+    float l[6], m = -1e9;
+    for (uint i = 0u; i < 6u; ++i) {
+        const float v = mix(mix(lg[t00 + i], lg[t01 + i], lx), mix(lg[t10 + i], lg[t11 + i], lx), ly);
+        l[i] = 6.0 * tanh(v * (1.0 / 6.0));
+        m = max(m, l[i]);
+    }
+    float s = 0.0; vec3 rgb = vec3(0.0);
+    for (uint i = 0u; i < 5u; ++i) { const float e = exp(l[i] - m); s += e; rgb += e * nfruUnpack(cand[base + i]); }
+    const float e5 = exp(l[5] - m); s += e5; rgb += e5 * nfruUnpack(c5_raw);
+    imageStore(outImage, ivec2(p), vec4(rgb / s, 1.0));
+}

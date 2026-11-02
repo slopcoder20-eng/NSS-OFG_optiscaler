@@ -1,0 +1,189 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+                                                          
+                                                                    
+                                         
+                                         
+                                         
+                                           
+                                           
+                                        
+                                            
+                                                      
+                            
+                                     
+                                
+                                                                                                     
+                                                      
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+vec3 sampleRGB_Clamp(Seg s, int y, int x) {
+    x = clamp(x, 0, int(s.t.w) - 1);
+    y = clamp(y, 0, int(s.t.h) - 1);
+    uint addr = (s.t.base >> 3u) + uint(y) * s.t.w + uint(x);
+    uvec2 w = ldv2(addr);
+    vec2 rg = unpackHalf2x16(w.x);
+    float b = unpackHalf2x16(w.y).x;
+    return vec3(rg.x, rg.y, b);
+}
+
+vec3 area2x2_RGB_Fast(Seg s, int y2, int x2) {
+    uint base = (s.t.base >> 3u) + uint(y2) * s.t.w + uint(x2);
+    uvec2 w00 = ldv2(base);
+    uvec2 w01 = ldv2(base + 1u);
+    uvec2 w10 = ldv2(base + s.t.w);
+    uvec2 w11 = ldv2(base + s.t.w + 1u);
+    vec2 rg00 = unpackHalf2x16(w00.x);
+    vec2 rg01 = unpackHalf2x16(w01.x);
+    vec2 rg10 = unpackHalf2x16(w10.x);
+    vec2 rg11 = unpackHalf2x16(w11.x);
+    float b00 = unpackHalf2x16(w00.y).x;
+    float b01 = unpackHalf2x16(w01.y).x;
+    float b10 = unpackHalf2x16(w10.y).x;
+    float b11 = unpackHalf2x16(w11.y).x;
+    vec2 rg = (rg00 + rg01 + rg10 + rg11) * 0.25;
+    float b = (b00 + b01 + b10 + b11) * 0.25;
+    return vec3(rg, b);
+}
+
+vec3 area2x2_RGB_orig(Seg s, int y2, int x2) {
+    vec3 c00 = sampleRGB_Clamp(s, y2,     x2);
+    vec3 c01 = sampleRGB_Clamp(s, y2,     x2 + 1);
+    vec3 c10 = sampleRGB_Clamp(s, y2 + 1, x2);
+    vec3 c11 = sampleRGB_Clamp(s, y2 + 1, x2 + 1);
+    return (c00 + c01 + c10 + c11) * 0.25;
+}
+
+vec2 readFlowS2(Seg s, int y, int x) {
+    x = clamp(x, 0, int(s.t.w) - 1);
+    y = clamp(y, 0, int(s.t.h) - 1);
+    uint addr = segByteAddr(s, 0u, y, x, 0u);
+    return unpackHalf2x16(arena_u32[addr >> 2u]);
+}
+
+float readScalarS2(Seg s, int y, int x) {
+    x = clamp(x, 0, int(s.t.w) - 1);
+    y = clamp(y, 0, int(s.t.h) - 1);
+    return segRead(s, 0u, y, x, 0u);
+}
+
+float checkOffFrame(vec2 fl, int ox_full, int oy_full, float W_full, float H_full) {
+    float qx = float(ox_full) + fl.x;
+    float qy = float(oy_full) + fl.y;
+    return (qx < -0.5 || qx > W_full - 0.5 || qy < -0.5 || qy > H_full - 0.5) ? 1.0 : 0.0;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                                                      
+    uint npix = to.w * to.h;
+    if (gid >= npix) return;
+
+    int oy = int(gid / to.w);
+    int ox = int(gid - uint(oy) * to.w);
+
+                                                                
+    int ox_full = ox * 2;
+    int oy_full = oy * 2;
+    float W_full = float(to.w * 2u);
+    float H_full = float(to.h * 2u);
+
+              
+                                           
+                                           
+                                           
+                                                                
+                                                                
+                                      
+                                      
+                                      
+                                      
+                                      
+                                      
+    Seg s_of    = segAt(0u);
+    Seg s_mva   = segAt(1u);
+    Seg s_mvb   = segAt(2u);
+    Seg s_warpa = segAt(3u);
+    Seg s_warpb = segAt(4u);
+    Seg s_fa    = segAt(5u);
+    Seg s_fb    = segAt(6u);
+    Seg s_ma    = segAt(7u);
+    Seg s_mb    = segAt(8u);
+    Seg s_hole  = segAt(9u);
+    Seg s_vis   = segAt(10u);
+
+                                            
+    vec3 of_col = area2x2_RGB_Fast(s_of,    oy_full, ox_full);
+    vec3 mva    = area2x2_RGB_Fast(s_mva,   oy_full, ox_full);
+    vec3 mvb    = area2x2_RGB_Fast(s_mvb,   oy_full, ox_full);
+    vec3 warpa  = area2x2_RGB_Fast(s_warpa, oy_full, ox_full);
+    vec3 warpb  = area2x2_RGB_Fast(s_warpb, oy_full, ox_full);
+
+                              
+    vec2 fa = readFlowS2(s_fa, oy, ox);
+    vec2 fb = readFlowS2(s_fb, oy, ox);
+    vec2 ma = readFlowS2(s_ma, oy, ox);
+    vec2 mb = readFlowS2(s_mb, oy, ox);
+    float hole = readScalarS2(s_hole, oy, ox);
+    float vis  = 1.0 / (1.0 + exp(-readScalarS2(s_vis, oy, ox)));                                                
+    float t_val = fcf(FC_T);
+
+                  
+    float d_of_mva  = dot(abs(of_col - mva), vec3(4.0 / 3.0));
+    float d_of_mvb  = dot(abs(of_col - mvb), vec3(4.0 / 3.0));
+    float d_mva_mvb = dot(abs(mva - mvb),    vec3(4.0 / 3.0));
+    float d_flow    = min(length(fa - ma) / 16.0, 4.0);
+
+                      
+    float oa    = checkOffFrame(fa * 2.0, ox_full, oy_full, W_full, H_full);
+    float ob    = checkOffFrame(fb * 2.0, ox_full, oy_full, W_full, H_full);
+    float offma = checkOffFrame(ma * 2.0, ox_full, oy_full, W_full, H_full);
+    float offmb = checkOffFrame(mb * 2.0, ox_full, oy_full, W_full, H_full);
+
+                                                                         
+    float d_of  = dot(abs(warpa - warpb), vec3(4.0 / 3.0));
+
+                                    
+    float f[21];
+    f[0]  = of_col.r; f[1]  = of_col.g; f[2]  = of_col.b;
+    f[3]  = mva.r;    f[4]  = mva.g;    f[5]  = mva.b;
+    f[6]  = mvb.r;    f[7]  = mvb.g;    f[8]  = mvb.b;
+    f[9]  = d_of_mva;
+    f[10] = d_of_mvb;
+    f[11] = d_mva_mvb;
+    f[12] = d_flow;
+    f[13] = oa;
+    f[14] = ob;
+    f[15] = offma;
+    f[16] = offmb;
+    f[17] = hole;
+    f[18] = vis;
+    f[19] = t_val;
+    f[20] = d_of;
+
+                                                         
+    float inv_scale = (to.scale > 1e-12) ? (1.0 / to.scale) : (127.0 / 4.0);
+    uint packed[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+
+    [[unroll]]
+    for (uint c = 0u; c < 21u; ++c) {
+        int q = clamp(int(round(f[c] * inv_scale)), -128, 127);
+        uint byte_val = uint(q) & 0xFFu;
+        uint w_idx = c >> 2u;
+        uint shift = (c & 3u) * 8u;
+        packed[w_idx] |= (byte_val << shift);
+    }
+
+                                                             
+    uint out_addr = tensorByteAddr(to, 0u, oy, ox, 0u);
+    [[unroll]]
+    for (uint j = 0u; j < 8u; ++j) {
+        arena_u32[(out_addr >> 2u) + j] = packed[j];
+    }
+}
+

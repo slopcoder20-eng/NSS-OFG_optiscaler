@@ -1,0 +1,141 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+                                               
+                                                                                             
+          
+                                                 
+                                                 
+                                                
+                                                
+                                                                        
+           
+                                                 
+                                                 
+                                                 
+                                                 
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+vec3 sampleRGB_Z(Seg s, int y, int x) {
+    if (x < 0 || y < 0 || x >= int(s.t.w) || y >= int(s.t.h)) return vec3(0.0);
+    uint addr = (s.t.base >> 3u) + uint(y) * s.t.w + uint(x);
+    uvec2 w = ldv2(addr);
+    vec2 rg = unpackHalf2x16(w.x);
+    float b = unpackHalf2x16(w.y).x;
+    return vec3(rg.x, rg.y, b);
+}
+
+vec3 warpColFast(Seg s, float u, float v) {
+    float x0f = floor(u), y0f = floor(v);
+    float ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    int W = int(s.t.w), H = int(s.t.h);
+
+    if (x0 >= 0 && x0 + 1 < W && y0 >= 0 && y0 + 1 < H) {
+        uint row0 = (s.t.base >> 3u) + uint(y0) * s.t.w;
+        uint row1 = row0 + s.t.w;
+        uvec2 w00 = ldv2(row0 + uint(x0));
+        uvec2 w01 = ldv2(row0 + uint(x0 + 1));
+        uvec2 w10 = ldv2(row1 + uint(x0));
+        uvec2 w11 = ldv2(row1 + uint(x0 + 1));
+
+        vec3 p00 = vec3(unpackHalf2x16(w00.x), unpackHalf2x16(w00.y).x);
+        vec3 p01 = vec3(unpackHalf2x16(w01.x), unpackHalf2x16(w01.y).x);
+        vec3 p10 = vec3(unpackHalf2x16(w10.x), unpackHalf2x16(w10.y).x);
+        vec3 p11 = vec3(unpackHalf2x16(w11.x), unpackHalf2x16(w11.y).x);
+
+        return mix(mix(p00, p01, ax), mix(p10, p11, ax), ay);
+    }
+
+    vec3 p00 = sampleRGB_Z(s, y0,     x0);
+    vec3 p01 = sampleRGB_Z(s, y0,     x0 + 1);
+    vec3 p10 = sampleRGB_Z(s, y0 + 1, x0);
+    vec3 p11 = sampleRGB_Z(s, y0 + 1, x0 + 1);
+
+    return mix(mix(p00, p01, ax), mix(p10, p11, ax), ay);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                                        
+    uint npix = to.w * to.h;
+    if (gid >= npix) return;
+
+    int oy = int(gid / to.w);
+    int ox = int(gid - uint(oy) * to.w);
+
+    Seg s_ca = segAt(0u);           
+    Seg s_cb = segAt(1u);           
+    Seg s_fa = segAt(2u);                             
+    Seg s_fb = segAt(3u);                             
+    Seg s_im = segAt(4u);                               
+    Seg s_mb = segAt(5u);           
+    Seg s_wa = segAt(6u);             
+    Seg s_wb = segAt(7u);             
+
+                                                    
+    float sx = float(s_fa.t.w) / float(to.w);       
+    float sy = float(s_fa.t.h) / float(to.h);       
+    float flow_scale = 1.0 / sx;                    
+    float fx = max((float(ox) + 0.5) * sx - 0.5, 0.0);
+    float fy = max((float(oy) + 0.5) * sy - 0.5, 0.0);
+    int x0 = int(fx);
+    int y0 = int(fy);
+    int x1 = min(x0 + 1, int(s_fa.t.w) - 1);
+    int y1 = min(y0 + 1, int(s_fa.t.h) - 1);
+    float ax = fx - float(x0);
+    float ay = fy - float(y0);
+
+                                                          
+    uint row0_f = uint(y0) * s_fa.t.w;
+    uint row1_f = uint(y1) * s_fa.t.w;
+    uint base_fa_u = s_fa.t.base >> 2u;
+    vec2 fa00 = unpackHalf2x16(arena_u32[base_fa_u + row0_f + uint(x0)]);
+    vec2 fa01 = unpackHalf2x16(arena_u32[base_fa_u + row0_f + uint(x1)]);
+    vec2 fa10 = unpackHalf2x16(arena_u32[base_fa_u + row1_f + uint(x0)]);
+    vec2 fa11 = unpackHalf2x16(arena_u32[base_fa_u + row1_f + uint(x1)]);
+    vec2 fa = flow_scale * mix(mix(fa00, fa01, ax), mix(fa10, fa11, ax), ay);
+
+    uint base_fb_u = s_fb.t.base >> 2u;
+    vec2 fb00 = unpackHalf2x16(arena_u32[base_fb_u + row0_f + uint(x0)]);
+    vec2 fb01 = unpackHalf2x16(arena_u32[base_fb_u + row0_f + uint(x1)]);
+    vec2 fb10 = unpackHalf2x16(arena_u32[base_fb_u + row1_f + uint(x0)]);
+    vec2 fb11 = unpackHalf2x16(arena_u32[base_fb_u + row1_f + uint(x1)]);
+    vec2 fb = flow_scale * mix(mix(fb00, fb01, ax), mix(fb10, fb11, ax), ay);
+
+                                                                                      
+    uint b00 = s_im.t.base + (row0_f + uint(x0)) * 12u;
+    uint b01 = s_im.t.base + (row0_f + uint(x1)) * 12u;
+    uint b10 = s_im.t.base + (row1_f + uint(x0)) * 12u;
+    uint b11 = s_im.t.base + (row1_f + uint(x1)) * 12u;
+
+    vec2 ma00 = unpackHalf2x16(arena_u32[b00 >> 2u]);
+    vec2 ma01 = unpackHalf2x16(arena_u32[b01 >> 2u]);
+    vec2 ma10 = unpackHalf2x16(arena_u32[b10 >> 2u]);
+    vec2 ma11 = unpackHalf2x16(arena_u32[b11 >> 2u]);
+    vec2 ma = flow_scale * mix(mix(ma00, ma01, ax), mix(ma10, ma11, ax), ay);
+
+    vec2 mb00 = unpackHalf2x16(arena_u32[(b00 >> 2u) + 1u]);
+    vec2 mb01 = unpackHalf2x16(arena_u32[(b01 >> 2u) + 1u]);
+    vec2 mb10 = unpackHalf2x16(arena_u32[(b10 >> 2u) + 1u]);
+    vec2 mb11 = unpackHalf2x16(arena_u32[(b11 >> 2u) + 1u]);
+    vec2 mb = flow_scale * mix(mix(mb00, mb01, ax), mix(mb10, mb11, ax), ay);
+
+    vec3 col_mva   = warpColFast(s_ca, float(ox) + ma.x, float(oy) + ma.y);
+    vec3 col_mvb   = warpColFast(s_cb, float(ox) + mb.x, float(oy) + mb.y);
+    vec3 col_warpa = warpColFast(s_ca, float(ox) + fa.x, float(oy) + fa.y);
+    vec3 col_warpb = warpColFast(s_cb, float(ox) + fb.x, float(oy) + fb.y);
+
+    uint addr_pix = uint(oy) * to.w + uint(ox);
+    uint addr_mva = (to.base >> 3u) + addr_pix;
+    uint addr_mvb = (s_mb.t.base >> 3u) + addr_pix;
+    uint addr_wa  = (s_wa.t.base >> 3u) + addr_pix;
+    uint addr_wb  = (s_wb.t.base >> 3u) + addr_pix;
+
+    stv2(addr_mva, uvec2(packHalf2x16(col_mva.rg), packHalf2x16(vec2(col_mva.b, 1.0))));
+    stv2(addr_mvb, uvec2(packHalf2x16(col_mvb.rg), packHalf2x16(vec2(col_mvb.b, 1.0))));
+    stv2(addr_wa,  uvec2(packHalf2x16(col_warpa.rg), packHalf2x16(vec2(col_warpa.b, 1.0))));
+    stv2(addr_wb,  uvec2(packHalf2x16(col_warpb.rg), packHalf2x16(vec2(col_warpb.b, 1.0))));
+}

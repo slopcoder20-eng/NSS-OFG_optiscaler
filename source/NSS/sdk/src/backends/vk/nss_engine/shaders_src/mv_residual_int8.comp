@@ -1,0 +1,46 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x=64) in;
+layout(constant_id=0) const uint PACK=0;
+layout(std430,binding=0) readonly buffer Inputs { float x[]; };
+layout(std430,binding=1) readonly buffer Weights { uint weights[]; };
+layout(std430,binding=2) writeonly buffer Outputs { float y[]; };
+layout(std430,binding=3) readonly buffer Skip { float skip_values[]; };
+layout(std430,binding=4) buffer Quantized { uint q[]; };
+layout(push_constant) uniform Params {
+    uint width,height,cin,cout,weight_offset,bias_offset,activation,use_skip;
+    float radius;
+} p;
+void main() {
+    uint index=gl_GlobalInvocationID.x+gl_GlobalInvocationID.y*gl_NumWorkGroups.x*64u;
+    uint groups=p.cin/4;
+    if(PACK==1) {
+        if(index>=p.width*p.height*groups) return;
+        uint ic=(index%groups)*4, pixel=index/groups, word=0;
+        for(uint c=0;c<4;c++) {
+            float s=uintBitsToFloat(weights[p.bias_offset+2*p.cout+ic+c]);
+            int v=int(clamp(roundEven(x[pixel*p.cin+ic+c]/s),-127.0,127.0));
+            word|=(uint(v)&255u)<<(8*c);
+        }
+        q[index]=word;
+        return;
+    }
+    if(index>=p.width*p.height*p.cout) return;
+    uint oc=index%p.cout, pixel=index/p.cout;
+    int px=int(pixel%p.width),py=int(pixel/p.width);
+    int sum=0;
+    for(int ky=0;ky<3;ky++) for(int kx=0;kx<3;kx++) {
+        int xx=px+kx-1, yy=py+ky-1;
+        if(xx<0||yy<0||xx>=int(p.width)||yy>=int(p.height)) continue;
+        uint qi=(uint(yy)*p.width+uint(xx))*groups;
+        uint wi=p.weight_offset+((oc*3+uint(ky))*3+uint(kx))*groups;
+        for(uint g=0;g<groups;g++)
+            sum+=dotPacked4x8EXT(int(q[qi+g]),int(weights[wi+g]));
+    }
+    sum+=int(weights[p.bias_offset+oc]);
+    float value=float(sum)*uintBitsToFloat(weights[p.bias_offset+p.cout+oc]);
+    if(p.use_skip!=0) value+=skip_values[index];
+    if(p.activation==1) value=max(value,0.0);
+    if(p.activation==2) value=p.radius*tanh(value);
+    y[index]=value;
+}

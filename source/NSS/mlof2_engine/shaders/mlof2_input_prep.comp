@@ -1,0 +1,206 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) uniform sampler2D s_ColorCurr;
+layout(set = 0, binding = 1) uniform sampler2D s_ColorPrev;
+layout(set = 0, binding = 2) uniform sampler2D s_DepthCurr;
+layout(set = 0, binding = 3) uniform sampler2D s_DepthPrev;
+layout(set = 0, binding = 4) uniform sampler2D s_Motion;
+
+layout(set = 0, binding = 5) buffer ArenaEnc { uint data[]; } b_ArenaEnc;
+layout(set = 0, binding = 6) buffer ArenaGen { uint data[]; } b_ArenaGen;
+
+layout(push_constant) uniform InputPrepPC {
+    uint dispW;
+    uint dispH;
+    uint padW;
+    uint padH;
+    float mvScaleX;
+    float mvScaleY;
+    float jitterX;
+    float jitterY;
+    uint isReverseZ;
+    uint mode;                                                                                                    
+                                                                                                                            
+    uint off_col;
+    uint off_dep;
+    uint off_col_a;
+    uint off_col_b;
+    uint off_dep_a;
+    uint off_dep_b;
+    uint off_ndc_a;
+    uint off_mv;
+    uint off_mvv;
+    uint depW, depH;                                                              
+    uint mvW, mvH;                                                                        
+    uint off_mv_full;                                                                                           
+} pc;
+
+                                                                                                   
+ivec2 texelOf(uint cx, uint cy, uint tw, uint th) {
+    return tw == 0u ? ivec2(cx, cy) : ivec2(min(uint((float(cx) + 0.5) * float(tw) / float(pc.dispW)), tw - 1u),
+                                            min(uint((float(cy) + 0.5) * float(th) / float(pc.dispH)), th - 1u));
+}
+float depthFeature(float d) {
+    if (pc.isReverseZ != 0u) d = 1.0 - d;
+    d = clamp(d, 0.0, 1.0 - 1e-6);
+    return clamp(-log2(max(1.0 - d, 1e-6)) / 16.0, 0.0, 1.0);
+}
+
+void main() {
+    uint gx = gl_GlobalInvocationID.x;
+    uint gy = gl_GlobalInvocationID.y;
+    if (gx >= pc.padW || gy >= pc.padH) return;
+
+                                                                                             
+    uint cx = min(gx, pc.dispW - 1u);
+    uint cy = min(gy, pc.dispH - 1u);
+    ivec2 ipos = ivec2(cx, cy);
+                                                                                                                 
+                                                                  
+    ivec2 ipos_d = (pc.depW == 0u) ? ipos : ivec2(min(uint((float(cx) + 0.5) * float(pc.depW) / float(pc.dispW)), pc.depW - 1u),
+                                               min(uint((float(cy) + 0.5) * float(pc.depH) / float(pc.dispH)), pc.depH - 1u));
+    ivec2 ipos_m = (pc.mvW == 0u) ? ipos : ivec2(min(uint((float(cx) + 0.5) * float(pc.mvW) / float(pc.dispW)), pc.mvW - 1u),
+                                               min(uint((float(cy) + 0.5) * float(pc.mvH) / float(pc.dispH)), pc.mvH - 1u));
+
+    uint px_idx = gy * pc.padW + gx;
+
+                                                                                                                       
+                                                                                                                    
+                                     
+    if ((pc.mode & 16u) != 0u) {
+        uint m = pc.mode & 15u;
+        uint ofW = ((pc.padW >> 1u) + 63u) & ~63u, ofH = ((pc.padH >> 1u) + 63u) & ~63u;
+        if (gx >= ofW || gy >= ofH) return;
+        vec3 cb = vec3(0.0), ca = vec3(0.0); float fb = 0.0, fa = 0.0;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint sx = min(2u * gx + (j & 1u), pc.dispW - 1u), sy = min(2u * gy + (j >> 1u), pc.dispH - 1u);
+            ivec2 dp = texelOf(sx, sy, pc.depW, pc.depH);
+            cb += texelFetch(s_ColorCurr, ivec2(sx, sy), 0).rgb;
+            fb += depthFeature(texelFetch(s_DepthCurr, dp, 0).r);
+            if (m == 2u) {
+                ca += texelFetch(s_ColorPrev, ivec2(sx, sy), 0).rgb;
+                fa += depthFeature(texelFetch(s_DepthPrev, dp, 0).r);
+            }
+        }
+        cb *= 0.25; ca *= 0.25; fb *= 0.25; fa *= 0.25;
+        uint hp = gy * ofW + gx;
+        if (m == 0u) {
+            uint base_col = (pc.off_col >> 2) + hp * 2u;
+            b_ArenaEnc.data[base_col + 0u] = packHalf2x16(cb.rg);
+            b_ArenaEnc.data[base_col + 1u] = packHalf2x16(vec2(cb.b, 1.0));
+            b_ArenaEnc.data[(pc.off_dep >> 2) + hp] = floatBitsToUint(fb);
+        } else if (m == 4u) {                                                  
+            uint ob = (pc.off_col >> 2) + hp * 3u;
+            b_ArenaEnc.data[ob + 0u] = floatBitsToUint(cb.r); b_ArenaEnc.data[ob + 1u] = floatBitsToUint(cb.g); b_ArenaEnc.data[ob + 2u] = floatBitsToUint(cb.b);
+            b_ArenaEnc.data[(pc.off_dep >> 2) + hp] = floatBitsToUint(fb);
+        } else {                                                               
+            uint npx = ofW * ofH;
+            uint ob = (pc.off_col >> 2) + hp * 3u, oa = (pc.off_col >> 2) + (npx + hp) * 3u;
+            b_ArenaEnc.data[ob + 0u] = floatBitsToUint(cb.r); b_ArenaEnc.data[ob + 1u] = floatBitsToUint(cb.g); b_ArenaEnc.data[ob + 2u] = floatBitsToUint(cb.b);
+            b_ArenaEnc.data[oa + 0u] = floatBitsToUint(ca.r); b_ArenaEnc.data[oa + 1u] = floatBitsToUint(ca.g); b_ArenaEnc.data[oa + 2u] = floatBitsToUint(ca.b);
+            b_ArenaEnc.data[(pc.off_dep >> 2) + hp] = floatBitsToUint(fb);
+            b_ArenaEnc.data[(pc.off_dep >> 2) + npx + hp] = floatBitsToUint(fa);
+        }
+        return;
+    }
+
+    if (pc.mode == 0u) {
+                                                                        
+        vec4 c = texelFetch(s_ColorCurr, ipos, 0);
+        uint u0 = packHalf2x16(vec2(c.r, c.g));
+        uint u1 = packHalf2x16(vec2(c.b, 1.0));
+        uint base_col = (pc.off_col >> 2) + px_idx * 2u;
+        b_ArenaEnc.data[base_col + 0u] = u0;
+        b_ArenaEnc.data[base_col + 1u] = u1;
+
+        float d = texelFetch(s_DepthCurr, ipos_d, 0).r;
+        if (pc.isReverseZ != 0u) d = 1.0 - d;
+        d = clamp(d, 0.0, 1.0 - 1e-6);
+        float dfeat = clamp(-log2(max(1.0 - d, 1e-6)) / 16.0, 0.0, 1.0);
+        uint base_dep = (pc.off_dep >> 2) + px_idx;
+        b_ArenaEnc.data[base_dep] = floatBitsToUint(dfeat);
+    } else if (pc.mode == 4u) {
+                                                                                         
+        vec4 cb = texelFetch(s_ColorCurr, ipos, 0);
+        uint ob = (pc.off_col >> 2) + px_idx * 3u;
+        b_ArenaEnc.data[ob + 0u] = floatBitsToUint(cb.r); b_ArenaEnc.data[ob + 1u] = floatBitsToUint(cb.g); b_ArenaEnc.data[ob + 2u] = floatBitsToUint(cb.b);
+        float db = texelFetch(s_DepthCurr, ipos_d, 0).r;
+        b_ArenaEnc.data[(pc.off_dep >> 2) + px_idx] = floatBitsToUint(depthFeature(db));
+    } else if (pc.mode == 2u) {
+                                                                                                                     
+                                                                                       
+        uint npx = pc.padW * pc.padH;
+        vec4 cb = texelFetch(s_ColorCurr, ipos, 0);
+        vec4 ca = texelFetch(s_ColorPrev, ipos, 0);
+        uint ob = (pc.off_col >> 2) + px_idx * 3u, oa = (pc.off_col >> 2) + (npx + px_idx) * 3u;
+        b_ArenaEnc.data[ob + 0u] = floatBitsToUint(cb.r); b_ArenaEnc.data[ob + 1u] = floatBitsToUint(cb.g); b_ArenaEnc.data[ob + 2u] = floatBitsToUint(cb.b);
+        b_ArenaEnc.data[oa + 0u] = floatBitsToUint(ca.r); b_ArenaEnc.data[oa + 1u] = floatBitsToUint(ca.g); b_ArenaEnc.data[oa + 2u] = floatBitsToUint(ca.b);
+        float db = texelFetch(s_DepthCurr, ipos_d, 0).r;
+        float da = texelFetch(s_DepthPrev, ipos_d, 0).r;
+        if (pc.isReverseZ != 0u) { db = 1.0 - db; da = 1.0 - da; }
+        db = clamp(db, 0.0, 1.0 - 1e-6); da = clamp(da, 0.0, 1.0 - 1e-6);
+        b_ArenaEnc.data[(pc.off_dep >> 2) + px_idx] = floatBitsToUint(clamp(-log2(max(1.0 - db, 1e-6)) / 16.0, 0.0, 1.0));
+        b_ArenaEnc.data[(pc.off_dep >> 2) + npx + px_idx] = floatBitsToUint(clamp(-log2(max(1.0 - da, 1e-6)) / 16.0, 0.0, 1.0));
+    } else {
+                                                 
+                                                             
+        vec4 ca = texelFetch(s_ColorPrev, ipos, 0);
+        vec4 cb = texelFetch(s_ColorCurr, ipos, 0);
+        uint ca0 = packHalf2x16(vec2(ca.r, ca.g));
+        uint ca1 = packHalf2x16(vec2(ca.b, 1.0));
+        uint cb0 = packHalf2x16(vec2(cb.r, cb.g));
+        uint cb1 = packHalf2x16(vec2(cb.b, 1.0));
+
+        uint base_ca = (pc.off_col_a >> 2) + px_idx * 2u;
+        uint base_cb = (pc.off_col_b >> 2) + px_idx * 2u;
+        b_ArenaGen.data[base_ca + 0u] = ca0;
+        b_ArenaGen.data[base_ca + 1u] = ca1;
+        b_ArenaGen.data[base_cb + 0u] = cb0;
+        b_ArenaGen.data[base_cb + 1u] = cb1;
+
+        const bool lanes = pc.mode == 3u;
+        const bool qpt = (gx & 3u) == 1u && (gy & 3u) == 1u;                              
+        const bool hpt = (gx & 1u) == 1u && (gy & 1u) == 1u;                           
+        if (!lanes || qpt) {
+        uint d_idx = lanes ? (gy >> 2u) * (pc.padW >> 2u) + (gx >> 2u) : px_idx;
+                                      
+        float raw_da = texelFetch(s_DepthPrev, ipos_d, 0).r;
+        float raw_db = texelFetch(s_DepthCurr, ipos_d, 0).r;
+        float da = (pc.isReverseZ != 0u) ? (1.0 - raw_da) : raw_da;
+        float db = (pc.isReverseZ != 0u) ? (1.0 - raw_db) : raw_db;
+        da = clamp(da, 0.0, 1.0 - 1e-6);
+        db = clamp(db, 0.0, 1.0 - 1e-6);
+        float dfeat_a = clamp(-log2(max(1.0 - da, 1e-6)) / 16.0, 0.0, 1.0);
+        float dfeat_b = clamp(-log2(max(1.0 - db, 1e-6)) / 16.0, 0.0, 1.0);
+
+        b_ArenaGen.data[(pc.off_dep_a >> 2) + d_idx] = floatBitsToUint(dfeat_a);
+        b_ArenaGen.data[(pc.off_dep_b >> 2) + d_idx] = floatBitsToUint(dfeat_b);
+
+                                                                     
+        float ndc_a = (pc.isReverseZ != 0u) ? clamp(raw_da, 0.0, 1.0) : (1.0 - clamp(raw_da, 0.0, 1.0));
+        b_ArenaGen.data[(pc.off_ndc_a >> 2) + d_idx] = floatBitsToUint(ndc_a);
+        }
+        if (lanes) {                                                                             
+            if (gx < pc.mvW && gy < pc.mvH) {
+                vec2 fmv = texelFetch(s_Motion, ivec2(gx, gy), 0).xy * vec2(pc.mvScaleX, pc.mvScaleY) * vec2(pc.dispW, pc.dispH);
+                uint fb = (pc.off_mv_full >> 2) + (gy * pc.mvW + gx) * 2u;
+                b_ArenaGen.data[fb + 0u] = floatBitsToUint(fmv.x);
+                b_ArenaGen.data[fb + 1u] = floatBitsToUint(fmv.y);
+            }
+            if (!hpt) return;
+        }
+        uint m_idx = lanes ? (gy >> 1u) * (pc.padW >> 1u) + (gx >> 1u) : px_idx;
+
+                                                                            
+        vec2 raw_mv = texelFetch(s_Motion, ipos_m, 0).xy;
+        vec2 scaled_mv = raw_mv * vec2(pc.mvScaleX, pc.mvScaleY) * vec2(pc.dispW, pc.dispH);
+        uint base_mv = (pc.off_mv >> 2) + m_idx * 2u;
+        b_ArenaGen.data[base_mv + 0u] = floatBitsToUint(scaled_mv.x);
+        b_ArenaGen.data[base_mv + 1u] = floatBitsToUint(scaled_mv.y);
+
+                                          
+        uint mvv_val = packHalf2x16(vec2(1.0, 1.0));
+        b_ArenaGen.data[(pc.off_mvv >> 2) + m_idx] = mvv_val;
+    }
+}

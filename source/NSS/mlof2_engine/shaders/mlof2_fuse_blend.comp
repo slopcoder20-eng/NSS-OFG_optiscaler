@@ -1,0 +1,270 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+                                                                                              
+          
+                                                
+                                                
+                                                
+                                                     
+                                                                                 
+                                                                     
+                                                                     
+                                                                                             
+                                                        
+          
+                                                   
+                                                                               
+                                                                                
+                                     
+                                                            
+                                        
+                                                                             
+                                                           
+#include "mlof2_common.glsl"
+
+#ifndef MLOF2_DX
+layout(set = 1, binding = 0) uniform sampler2D uExtColB;
+layout(set = 1, binding = 1) uniform sampler2D uExtColA;
+layout(set = 1, binding = 2) uniform sampler2D uExtDepB;
+layout(set = 1, binding = 3) uniform sampler2D uExtDepA;
+layout(set = 1, binding = 4) uniform sampler2D uExtMv;
+layout(set = 1, binding = 5) uniform writeonly image2D uExtOut;                                        
+layout(set = 1, binding = 6) uniform sampler2D uExtFull;                                                                
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+                                                                            
+                                                                             
+                                                                               
+shared vec2 ruleTile[5 * 68];
+
+vec3 readRGB_Fast(Seg s, int y, int x) {
+    if (x < 0 || x >= int(s.t.w) || y < 0 || y >= int(s.t.h)) {
+        return vec3(0.0);
+    }
+    uint addr = (s.t.base >> 3u) + uint(y) * s.t.w + uint(x);
+    uvec2 w = ldv2(addr);
+    vec2 rg = unpackHalf2x16(w.x);
+    float b = unpackHalf2x16(w.y).x;
+    return vec3(rg.x, rg.y, b);
+}
+
+                                                                   
+                                                                                   
+vec3 readLogitsScale2(Seg s, int x2, int y2) {
+    int W2 = int(s.t.w * 4u);
+    int H2 = int(s.t.h * 4u);
+    x2 = clamp(x2, 0, W2 - 1);
+    y2 = clamp(y2, 0, H2 - 1);
+
+    int h8 = y2 >> 2;
+    int w8 = x2 >> 2;
+    int sy = y2 & 3;
+    int sx = x2 & 3;
+    uint k_sub = uint(sy * 4 + sx);         
+
+                                            
+                                
+                                  
+                                  
+    uint c_of  = k_sub;
+    uint c_mva = 16u + k_sub;
+    uint c_mvb = 32u + k_sub;
+
+    float lg_of  = segRead(s, 0u, h8, w8, c_of);
+    float lg_mva = segRead(s, 0u, h8, w8, c_mva);
+    float lg_mvb = segRead(s, 0u, h8, w8, c_mvb);
+
+    return vec3(lg_of, lg_mva, lg_mvb);
+}
+
+                                                                                           
+float box5x5_diff(Seg sa, Seg sb, int cy, int cx) {
+    float sum_diff = 0.0;
+    [[dont_unroll]]
+    for (int dy = -2; dy <= 2; ++dy) {
+        [[dont_unroll]]
+        for (int dx = -2; dx <= 2; ++dx) {
+            vec3 ca = readRGB_Fast(sa, cy + dy, cx + dx);
+            vec3 cb = readRGB_Fast(sb, cy + dy, cx + dx);
+            sum_diff += (abs(ca.r - cb.r) + abs(ca.g - cb.g) + abs(ca.b - cb.b)) * (1.0 / 3.0);
+        }
+    }
+    return sum_diff * 0.04;              
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                                         
+    uint npix = to.w * to.h;
+    uint nseg = opw(OP_NSEG);
+    float rule_margin = 0.0;
+    if (opw(OP_FP) != 0u) rule_margin = max(opf(0), 0.0);
+    bool ruleEnabled = rule_margin > 0.0 && rule_margin < 1.0 && nseg >= 6u;
+                                                                            
+                                                     
+    bool tiledRule = ruleEnabled && (to.w & 63u) == 0u;
+    if (tiledRule) {
+        uint first = gl_WorkGroupID.x * 64u;
+        int bx = int(first % to.w), by = int(first / to.w);
+        Seg wa = segAt(4u), wb = segAt(5u);
+        Seg ma = segAt(1u), mb = segAt(2u);
+        uint b_wa = wa.t.base >> 3u;
+        uint b_wb = wb.t.base >> 3u;
+        uint b_ma = ma.t.base >> 3u;
+        uint b_mb = mb.t.base >> 3u;
+        int W = int(to.w), H = int(to.h);
+
+        for (uint i = gl_LocalInvocationID.x; i < 340u; i += 64u) {
+            int x = bx + int(i % 68u) - 2;
+            int y = by + int(i / 68u) - 2;
+            if (x >= 0 && x < W && y >= 0 && y < H) {
+                uint addr = uint(y) * to.w + uint(x);
+                uvec2 v_wa = ldv2(b_wa + addr);
+                uvec2 v_wb = ldv2(b_wb + addr);
+                uvec2 v_ma = ldv2(b_ma + addr);
+                uvec2 v_mb = ldv2(b_mb + addr);
+                vec3 p_wa = vec3(unpackHalf2x16(v_wa.x), unpackHalf2x16(v_wa.y).x);
+                vec3 p_wb = vec3(unpackHalf2x16(v_wb.x), unpackHalf2x16(v_wb.y).x);
+                vec3 p_ma = vec3(unpackHalf2x16(v_ma.x), unpackHalf2x16(v_ma.y).x);
+                vec3 p_mb = vec3(unpackHalf2x16(v_mb.x), unpackHalf2x16(v_mb.y).x);
+                vec3 od = abs(p_wa - p_wb);
+                vec3 md = abs(p_ma - p_mb);
+                ruleTile[i] = vec2((od.r + od.g + od.b) * (1.0 / 3.0),
+                                   (md.r + md.g + md.b) * (1.0 / 3.0));
+            } else {
+                ruleTile[i] = vec2(0.0);
+            }
+        }
+        barrier();
+    }
+    if (gid >= npix) return;
+
+    int oy = int(gid / to.w);
+    int ox = int(gid - uint(oy) * to.w);
+
+    Seg s_of  = segAt(0u);
+    Seg s_mva = segAt(1u);
+    Seg s_mvb = segAt(2u);
+    Seg s_lg  = segAt(3u);
+
+                                                                                          
+    uint pix_idx = uint(oy) * to.w + uint(ox);
+    uvec2 w_of  = ldv2((s_of.t.base  >> 3u) + pix_idx);
+    uvec2 w_mva = ldv2((s_mva.t.base >> 3u) + pix_idx);
+    uvec2 w_mvb = ldv2((s_mvb.t.base >> 3u) + pix_idx);
+    vec3 col_of  = vec3(unpackHalf2x16(w_of.x),  unpackHalf2x16(w_of.y).x);
+    vec3 col_mva = vec3(unpackHalf2x16(w_mva.x), unpackHalf2x16(w_mva.y).x);
+    vec3 col_mvb = vec3(unpackHalf2x16(w_mvb.x), unpackHalf2x16(w_mvb.y).x);
+
+                                                             
+    float fx = max((float(ox) + 0.5) * 0.5 - 0.5, 0.0);
+    float fy = max((float(oy) + 0.5) * 0.5 - 0.5, 0.0);
+    int x0 = int(fx);
+    int y0 = int(fy);
+    float ax = fx - float(x0);
+    float ay = fy - float(y0);
+
+    vec3 lg00 = readLogitsScale2(s_lg, x0,     y0);
+    vec3 lg01 = readLogitsScale2(s_lg, x0 + 1, y0);
+    vec3 lg10 = readLogitsScale2(s_lg, x0,     y0 + 1);
+    vec3 lg11 = readLogitsScale2(s_lg, x0 + 1, y0 + 1);
+
+    vec3 lg = (1.0 - ay) * ((1.0 - ax) * lg00 + ax * lg01) +
+                    ay  * ((1.0 - ax) * lg10 + ax * lg11);
+
+                    
+    float max_lg = max(lg.x, max(lg.y, lg.z));
+    vec3 exp_lg = exp(lg - vec3(max_lg));
+    float sum_exp = exp_lg.x + exp_lg.y + exp_lg.z;
+    vec3 w = exp_lg / max(sum_exp, 1e-6);
+
+                  
+    vec3 final_rgb = clamp(w.x * col_of + w.y * col_mva + w.z * col_mvb, 0.0, 1.0);
+
+                                                                 
+                                                                                     
+                                                                                                                        
+    float t_val = fcf(FC_T);
+    float d_of = 0.0;
+    float d_mv = 0.0;
+    bool on_screen = true;
+    if (ruleEnabled) {
+        if (tiledRule) {
+            vec2 sum_diff = vec2(0.0);
+            [[dont_unroll]] for (uint y = 0u; y < 5u; ++y)
+                [[dont_unroll]] for (uint x = 0u; x < 5u; ++x)
+                    sum_diff += ruleTile[y * 68u + gl_LocalInvocationID.x + x];
+            d_of = sum_diff.x * 0.04;
+            d_mv = sum_diff.y * 0.04;
+        } else {
+            d_of = box5x5_diff(segAt(4u), segAt(5u), oy, ox);
+            d_mv = box5x5_diff(s_mva, s_mvb, oy, ox);
+        }
+
+        if (nseg >= 7u) {
+            Seg s_inv = segAt(6u);
+            int x2 = clamp(ox >> 1, 0, int(s_inv.t.w) - 1);
+            int y2 = clamp(oy >> 1, 0, int(s_inv.t.h) - 1);
+            float offb = segRead(s_inv, 0u, y2, x2, 5u);
+            vec2 ma = 2.0 * segRead2(s_inv, 0u, y2, x2, 0u);
+            float qx = float(ox) + ma.x;
+            float qy = float(oy) + ma.y;
+            bool offa = (qx < -0.5 || qx > float(to.w) - 0.5 || qy < -0.5 || qy > float(to.h) - 0.5);
+            on_screen = (!offa) && (offb < 0.5);
+        }
+
+        if ((d_of > d_mv + rule_margin) && on_screen) {
+            final_rgb = clamp((1.0 - t_val) * col_mva + t_val * col_mvb, 0.0, 1.0);
+        }
+    }
+
+    uint dbg = uint(fcf(FC_OFG_DEBUG));
+    if (dbg == 1u && nseg >= 8u) {
+        Seg s_vis = segAt(7u);
+        int x2 = clamp(ox >> 1, 0, int(s_vis.t.w) - 1);
+        int y2 = clamp(oy >> 1, 0, int(s_vis.t.h) - 1);
+        float v = segRead(s_vis, 0u, y2, x2, 0u);
+        final_rgb = vec3(v);
+    } else if (dbg == 2u) {
+        final_rgb = w;
+    } else if (dbg == 3u) {
+        final_rgb = vec3(clamp(d_of * 5.0, 0.0, 1.0), clamp(d_mv * 5.0, 0.0, 1.0), on_screen ? 1.0 : 0.0);
+    } else if (dbg == 4u) {
+        final_rgb = clamp(w.x * col_of + w.y * col_mva + w.z * col_mvb, 0.0, 1.0);
+    }
+
+                 
+    uint addr = tensorByteAddr(to, 0u, oy, ox, 0u);
+    if (to.fmt == 1u) {        
+        uvec2 packed = uvec2(packHalf2x16(final_rgb.rg), packHalf2x16(vec2(final_rgb.b, 1.0)));
+        stv2(addr >> 3u, packed);
+    } else {        
+        arena_u32[addr >> 2u]         = floatBitsToUint(final_rgb.r);
+        arena_u32[(addr >> 2u) + 1u]  = floatBitsToUint(final_rgb.g);
+        arena_u32[(addr >> 2u) + 2u]  = floatBitsToUint(final_rgb.b);
+        arena_u32[(addr >> 2u) + 3u]  = floatBitsToUint(1.0);
+    }
+
+#ifndef MLOF2_DX
+    if (fcf(FC_EXT_OUT) > 0.5) {
+        uint dw = uint(fcf(FC_EXT_DISP_W)), dh = uint(fcf(FC_EXT_DISP_H));
+        if (uint(ox) < dw && uint(oy) < dh) {
+            vec3 rgb = clamp(final_rgb, 0.0, 1.0);
+            uint hm = uint(fcf(FC_EXT_HUD));
+            if (hm != 0u) {
+                vec3 fullColor = texelFetch(uExtFull, ivec2(ox, oy), 0).rgb;
+                vec3 sceneColor = texelFetch(uExtColB, ivec2(ox, oy), 0).rgb;
+                vec3 tolerance = hm == 2u ? abs(sceneColor) * vec3(1.0 / 64.0, 1.0 / 64.0, 1.0 / 32.0) + vec3(1.0 / 255.0)
+                                          : vec3(1.0 / 4096.0);
+                if (any(greaterThan(abs(fullColor - sceneColor), tolerance))) rgb = fullColor;
+            }
+            imageStore(uExtOut, ivec2(ox, oy), vec4(rgb, 1.0));
+        }
+    }
+#endif
+}
+

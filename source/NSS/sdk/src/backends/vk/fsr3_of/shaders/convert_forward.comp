@@ -1,0 +1,13 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform itexture2D r_optical_flow_previous;
+layout(set=0,binding=1,rg16f) uniform image2D rw_nfru_flow;
+void main(){
+ ivec2 p=ivec2(gl_GlobalInvocationID.xy),s=imageSize(rw_nfru_flow);if(any(greaterThanEqual(p,s)))return;
+ ivec2 rawSize=textureSize(r_optical_flow_previous,0);
+                                                                               
+                                                                                 
+ ivec2 q=clamp(ivec2(floor((vec2(p)+0.5)*vec2(rawSize)/vec2(s))),ivec2(0),rawSize-1);
+ imageStore(rw_nfru_flow,p,vec4(vec2(texelFetch(r_optical_flow_previous,q,0).xy),0,0));
+}

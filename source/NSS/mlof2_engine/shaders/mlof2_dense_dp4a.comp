@@ -1,0 +1,118 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_integer_dot_product : require
+#extension GL_GOOGLE_include_directive : enable
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define ACC4(acc, a, b) acc = dotPacked4x8AccSatEXT(int(a), int(b), acc)
+
+                                                                              
+                                                                         
+uint packSeg4Z(const in Seg s, uint srow, int yy, int xx, uint c, float qs, float sc_qs) {
+    bool in_ = xx >= 0 && yy >= 0 && xx < int(s.t.w) && yy < int(s.t.h);
+    if (!in_) return 0u;
+    vec4 v = vec4(0.0);
+    if (c + 4u <= s.c) {
+        if (s.t.fmt == 2u && ((s.c_off + c) & 3u) == 0u && (s.t.c_alloc & 3u) == 0u) {
+            uint addr = s.t.base + ((srow * s.t.h + uint(yy)) * s.t.w + uint(xx)) * s.t.c_alloc + s.c_off + c;
+            int w = int(arena_u32[addr >> 2u]);
+            v = vec4(
+                float(bitfieldExtract(w, 0, 8)),
+                float(bitfieldExtract(w, 8, 8)),
+                float(bitfieldExtract(w, 16, 8)),
+                float(bitfieldExtract(w, 24, 8))
+            ) * sc_qs;
+        } else {
+            v = segRead4(s, srow, yy, xx, c) * qs;
+        }
+    } else {
+        for (uint lane = 0u; lane < 4u; ++lane) {
+            if (c + lane < s.c) v[lane] = segRead(s, srow, yy, xx, c + lane) * qs;
+        }
+    }
+    ivec4 q = ivec4(clamp(roundEven(v), -127.0, 127.0));
+    return (uint(q.x) & 0xFFu) | ((uint(q.y) & 0xFFu) << 8u) |
+           ((uint(q.z) & 0xFFu) << 16u) | ((uint(q.w) & 0xFFu) << 24u);
+}
+
+void main() {
+    Tensor t = outAt();
+    uint p0 = gl_GlobalInvocationID.x * 2u, c0 = gl_WorkGroupID.y * 4u;
+    uint out_c = opw(OP_OUT_C);
+    uint hw = t.h * t.w, total_pix = t.n * hw;
+    if (p0 >= total_pix || c0 >= out_c) return;
+
+    int kh = opi(0), kw = opi(1), stride = opi(2), pad = opi(3), dil = opi(4);
+    uint rowA = p0 / hw, rA = p0 - rowA * hw, p1 = p0 + 1u;
+    bool hasB = p1 < total_pix;
+    uint rowB = hasB ? (p1 / hw) : 0u, rB = hasB ? (p1 - rowB * hw) : 0u;
+    int ya = int(rA / t.w), xa = int(rA % t.w), yb = int(rB / t.w), xb = int(rB % t.w);
+
+    ivec4 aa = ivec4(0), ab = ivec4(0);
+    uint kw_words = opw(OP_KW_WORDS);
+    uint icw = kw_words / uint(kh * kw);
+    uint w_base = opw(OP_W_OFF) + c0 * kw_words;
+    uint nseg = opw(OP_NSEG);
+    float qs = opf(0u);
+    uint noc = min(4u, out_c - c0);
+
+    for (int ky = 0; ky < kh; ++ky) {
+        for (int kx = 0; kx < kw; ++kx) {
+            uint gw = 0u;
+            uint tap_base = w_base + uint(ky * kw + kx) * icw;
+            for (uint si = 0u; si < nseg; ++si) {
+                Seg s = segAt(si);
+                uint srowA = srcRow(s, rowA);
+                uint srowB = hasB ? srcRow(s, rowB) : 0u;
+                float sc_qs = s.t.scale * qs;
+                int iya = ya * stride - pad + ky * dil, ixa = xa * stride - pad + kx * dil;
+                int iyb = yb * stride - pad + ky * dil, ixb = xb * stride - pad + kx * dil;
+
+                for (uint c = 0u; c < s.c; c += 4u) {
+                    uint pa = packSeg4Z(s, srowA, iya, ixa, c, qs, sc_qs);
+                    uint pb = hasB ? packSeg4Z(s, srowB, iyb, ixb, c, qs, sc_qs) : 0u;
+                    uint wi = tap_base + gw + (c >> 2u);
+                    int w0 = int(blob[wi]);
+                    ACC4(aa.x, pa, w0); ACC4(ab.x, pb, w0);
+                    if (noc > 1u) { int w1 = int(blob[wi + kw_words]); ACC4(aa.y, pa, w1); ACC4(ab.y, pb, w1); }
+                    if (noc > 2u) { int w2 = int(blob[wi + 2u * kw_words]); ACC4(aa.z, pa, w2); ACC4(ab.z, pb, w2); }
+                    if (noc > 3u) { int w3 = int(blob[wi + 3u * kw_words]); ACC4(aa.w, pa, w3); ACC4(ab.w, pb, w3); }
+                }
+                gw += (s.c + 3u) / 4u;
+            }
+        }
+    }
+
+    uint out_coff = opw(OP_OUT_COFF);
+    int act = opi(5), res_t = opi(6), res_c = opi(7);
+    uint so = opw(OP_SCALE_OFF), bo = opw(OP_BIAS_OFF);
+    Tensor rt;
+    uint rc0 = 0u;
+    if (res_t >= 0) {
+        rt = tensorAt(uint(res_t));
+        rc0 = uint(res_c < 0 ? -1 - res_c : res_c);
+    }
+
+    for (uint oc = 0u; oc < noc; ++oc) {
+        uint ch = c0 + oc;
+        float sc = uintBitsToFloat(blob[so + ch]);
+        float bias = uintBitsToFloat(blob[bo + ch]);
+        for (int b = 0; b < 2; ++b) {
+            if (b == 0 || hasB) {
+                uint row = b == 0 ? rowA : rowB;
+                int y = b == 0 ? ya : yb, x = b == 0 ? xa : xb;
+                float v = float(b == 0 ? aa[oc] : ab[oc]) * sc + bias, r = 0.0;
+                if (res_t >= 0) {
+                    r = tensorRead(rt, row, y, x, rc0 + ch);
+                    if (res_c < 0) v += r;
+                }
+                if (act == 1) v = leaky(v);
+                else if (act == 2) v = max(v, 0.0);
+                if (res_t >= 0 && res_c >= 0) v += r;
+                tensorWrite(t, row, y, x, out_coff + ch, v);
+            }
+        }
+    }
+}

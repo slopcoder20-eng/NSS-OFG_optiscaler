@@ -1,0 +1,374 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_GOOGLE_include_directive : enable
+#ifndef MLOF2_DX
+                                                                                                                            
+                                                                                                                     
+#extension GL_NV_cooperative_matrix2 : enable
+#define MLOF2_EPI_REG 1
+#endif
+                                                                                                                  
+                                                                                                                   
+                                                                                            
+                                                                                                                   
+                                                                                                                    
+                                                                                            
+                                                                                                                        
+                                                                                                                  
+                                                                                                                      
+                                                                                                                     
+                                                 
+                                                                                                                
+                                                                                                                       
+                                                                                                                      
+                                                                   
+                                                                                                                   
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#ifndef MLOF2_DX
+layout(constant_id = 3) const uint RT = 1u;                                                       
+layout(constant_id = 4) const uint SW = 8u;                                                                
+layout(constant_id = 5) const uint FUSE = 0u;                                                                       
+layout(constant_id = 6) const uint PF = 24u;                                                        
+#else
+const uint RT = 1u;
+const uint SW = 8u;
+const uint FUSE = 0u;
+const uint PF = 24u;
+#endif
+
+#include "mlof2_coop_epi.glsl"
+
+shared uint sh[3072];                                                                                                    
+
+void main() {
+    Tensor to = tensorAt(opw(OP_OUT));
+    uint out_coff = opw(OP_OUT_COFF), out_c = opw(OP_OUT_C);
+    uint tid = gl_LocalInvocationID.x, wave = tid >> 5u;
+    const uint TR = 4u * RT;               
+    uint tx = (to.w + 15u) / 16u, ty = (to.h + TR - 1u) / TR;
+    uint tile = gl_WorkGroupID.x, row = tile / (tx * ty), trem = tile - row * tx * ty;
+    int oyb = int(trem / tx) * int(TR), oxb = int(trem - (trem / tx) * tx) * 16;
+    const uint OCW = 64u / RT;                                   
+    uint oc0 = gl_WorkGroupID.y * OCW;
+
+    int kh = opi(0), kw = opi(1), stride = opi(2), pad = opi(3), dil = opi(4), act = opi(5);
+    int res_t = opi(6), res_c = opi(7);
+    uint w_off = opw(OP_W_OFF), kw_words = opw(OP_KW_WORDS);
+    uint taps = uint(kh * kw), icw = (kh == 1 && kw == 1) ? kw_words : (kw_words / taps);                                                             
+    uint nseg = opw(OP_NSEG);
+    uint segw0[9];
+    segw0[0] = 0u;
+    for (uint si = 0u; si < nseg; ++si) { Seg s = segAt(si); segw0[si + 1u] = segw0[si] + (s.c + 3u) / 4u; }
+    Seg s0 = segAt(0u);
+    int ih = int(s0.t.h), iw = int(s0.t.w);
+
+                                   
+    int RH = int(TR - 1u) * stride + (kh - 1) * dil + 1, RW = 15 * stride + (kw - 1) * dil + 1;
+    int iy0 = oyb * stride - pad, ix0 = oxb * stride - pad;
+
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4];
+    for (uint nb = 0u; nb < 4u; ++nb) acc[nb] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    uint nblk = min(4u / RT, (out_c - oc0 + 15u) / 16u);
+
+    bool is_1x1 = (kh == 1 && kw == 1 && stride == 1 && pad == 0);
+    if (is_1x1) {
+                                                   
+        bool tile_in_bounds = (oxb + 16 <= int(iw)) && (oyb + int(4u * RT) <= int(ih));
+        uint total_words = 256u * RT;
+        for (uint cw0 = 0u; cw0 < icw; cw0 += 4u) {
+            uint si = 0u;
+            if (nseg > 1u) { for (uint st = 1u; st < nseg; ++st) if (cw0 >= segw0[st]) si = st; }
+            Seg sg_curr = segAt(si);
+            bool is_pure = (cw0 + 4u <= segw0[si + 1u]) && (sg_curr.t.fmt == 2u) && tile_in_bounds;
+
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[4u / RT];
+            for (uint nb = 0u; nb < 4u / RT; ++nb)
+                if (nb < nblk)
+                    coopMatLoad(b[nb], blob, w_off + (oc0 + nb * 16u) * kw_words + cw0, kw_words,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+
+            if (is_pure) {
+                                                                                        
+                Seg sg = sg_curr;
+                uint cs = (cw0 - segw0[si]) * 4u;
+                uint astride = sg.t.c_alloc >> 2u;
+                for (uint r = 0u; r < RT; ++r) {
+                    int iy = oyb + int(wave * RT + r);
+                    uint abase = segByteAddr(sg, row, iy, oxb, cs) >> 2u;
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                    coopMatLoad(a, arena_u32, abase, astride, gl_CooperativeMatrixLayoutRowMajor);
+                    for (uint nb = 0u; nb < 4u / RT; ++nb) {
+                        if (nb >= nblk) break;
+                        acc[r * (4u / RT) + nb] = coopMatMulAdd(a, b[nb], acc[r * (4u / RT) + nb]);
+                    }
+                }
+            } else {
+                                                                                                         
+                for (uint j = 0u; j < 2u * RT; ++j) {
+                    uint idx = tid + 128u * j;
+                    if (idx < total_words) {
+                        uint px = idx >> 2u, cw_rel = idx & 3u;
+                        uint r = px >> 4u, m = px & 15u;
+                        int iy = oyb + int(r), ix = oxb + int(m);
+                        uint cw = cw0 + cw_rel;
+                        uint s_idx = 0u;
+                        if (nseg > 1u) { for (uint st = 1u; st < nseg; ++st) if (cw >= segw0[st]) s_idx = st; }
+                        uint cs = (cw - segw0[s_idx]) * 4u;
+                        Seg sg = segAt(s_idx);
+                        uint val = 0u;
+                        if (cw < icw && iy >= 0 && ix >= 0 && iy < int(ih) && ix < int(iw)) {
+                            uint keep = cs + 4u <= sg.c ? 0xFFFFFFFFu : ((1u << ((sg.c - cs) * 8u)) - 1u);
+                            val = arena_u32[segByteAddr(sg, row, iy, ix, cs) >> 2u] & keep;
+                        }
+                        sh[idx] = val;
+                    }
+                }
+                barrier();
+                for (uint r = 0u; r < RT; ++r) {
+                    uint abase = (wave * RT + r) * 64u;
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                    coopMatLoad(a, sh, abase, 4u, gl_CooperativeMatrixLayoutRowMajor);
+                    for (uint nb = 0u; nb < 4u / RT; ++nb) {
+                        if (nb >= nblk) break;
+                        acc[r * (4u / RT) + nb] = coopMatMulAdd(a, b[nb], acc[r * (4u / RT) + nb]);
+                    }
+                }
+                barrier();
+            }
+        }
+    } else {
+                                                                                                            
+                                                                                                                  
+    const uint SWS = SW == 8u ? 3u : 2u;
+    uint npx = uint(RH * RW), nw = npx * SW, lane = tid & (SW - 1u), nsl = (nw + 127u) / 128u;
+    uint pre[PF];
+    for (uint cw0 = 0u; cw0 < icw + SW; cw0 += SW) {                                                                
+        if (cw0 > 0u) {
+            for (uint j = 0u; j < PF; ++j) { if (j >= nsl) break; uint i = tid + 128u * j; if (i < nw) sh[i] = pre[j]; }
+        }
+        if (cw0 < icw) {
+            uint cw = cw0 + lane, si = 0u;
+            if (nseg > 1u) { for (uint s = 1u; s < nseg; ++s) if (cw >= segw0[s]) si = s; }
+            uint cs = (cw - segw0[si]) * 4u;
+            bool cok = cw < icw;
+            Seg sg = segAt(si);
+            uint keep = cs + 4u <= sg.c ? 0xFFFFFFFFu : ((1u << ((sg.c - cs) * 8u)) - 1u);
+            bool rw16 = (RW == 16);
+            for (uint j = 0u; j < PF; ++j) {
+                if (j >= nsl) break;
+                uint i = tid + 128u * j, px = i >> SWS;
+                int r = rw16 ? (int(px) >> 4) : (int(px) / RW);
+                int c = rw16 ? (int(px) & 15) : (int(px) - r * RW);
+                int iy = iy0 + r, ix = ix0 + c;
+                pre[j] = (i < nw && cok && iy >= 0 && ix >= 0 && iy < ih && ix < iw) ?
+                         arena_u32[segByteAddr(sg, row, iy, ix, cs) >> 2u] & keep : 0u;
+            }
+        }
+        if (cw0 == 0u) continue;
+        uint cws = cw0 - SW;                                                       
+        barrier();
+        for (int ky = 0; ky < kh; ++ky)
+            for (int kx = 0; kx < kw; ++kx) {
+                uint tap = uint(ky * kw + kx);
+                for (uint ks = 0u; ks < SW / 4u; ++ks) {
+                    if (cws + ks * 4u >= icw) break;
+                    if (RT == 1u) {
+                        uint abase = uint(((int(wave) * stride + ky * dil) * RW + kx * dil) * int(SW));
+                        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                        coopMatLoad(a, sh, abase + ks * 4u, uint(stride) * SW, gl_CooperativeMatrixLayoutRowMajor);
+                        for (uint nb = 0u; nb < 4u; ++nb) {
+                            if (nb >= nblk) break;
+                            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                            coopMatLoad(b, blob, w_off + (oc0 + nb * 16u) * kw_words + tap * icw + cws + ks * 4u, kw_words,
+                                        gl_CooperativeMatrixLayoutColumnMajor);
+                            acc[nb] = coopMatMulAdd(a, b, acc[nb]);
+                        }
+                    } else {                                                                    
+                        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b[4u / RT];
+                        for (uint nb = 0u; nb < 4u / RT; ++nb)
+                            if (nb < nblk)
+                                coopMatLoad(b[nb], blob, w_off + (oc0 + nb * 16u) * kw_words + tap * icw + cws + ks * 4u, kw_words,
+                                            gl_CooperativeMatrixLayoutColumnMajor);
+                        for (uint r = 0u; r < RT; ++r) {
+                            uint abase = uint(((int(wave * RT + r) * stride + ky * dil) * RW + kx * dil) * int(SW));
+                            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+                            coopMatLoad(a, sh, abase + ks * 4u, uint(stride) * SW, gl_CooperativeMatrixLayoutRowMajor);
+                            for (uint nb = 0u; nb < 4u / RT; ++nb)
+                                if (nb < nblk) acc[r * (4u / RT) + nb] = coopMatMulAdd(a, b[nb], acc[r * (4u / RT) + nb]);
+                        }
+                    }
+                }
+            }
+        barrier();
+    }
+    }
+
+    uint so = opw(OP_SCALE_OFF), bo = opw(OP_BIAS_OFF);
+    Seg sres;
+    if (res_t >= 0) { sres.t = tensorAt(uint(res_t)); sres.c_off = res_c >= 0 ? uint(res_c) : uint(-1 - res_c); sres.c = sres.t.c; sres.swap = false; }
+    bool ureg[4] = bool[4](false, false, false, false);                                             
+    bool skip_lds = false;
+#ifdef MLOF2_EPI_REG
+    {                                                                                                                 
+        uint esz = to.fmt == 1u ? 2u : 1u;
+        bool tile_ok = (to.fmt == 2u || to.fmt == 1u) && (res_t < 0 || sres.t.fmt <= 2u) && oxb + 16 <= int(to.w) &&
+                       ((to.c_alloc * esz) & 3u) == 0u;
+        if (tile_ok) {
+            float inv = 1.0 / to.scale;
+            uint rfmt = res_t >= 0 ? sres.t.fmt : 0xFu, rmode = res_c < 0 ? 1u : 0u;
+            uint resz = rfmt == 0u ? 4u : (rfmt == 1u ? 2u : 1u), rpx = res_t >= 0 ? sres.t.c_alloc * resz : 0u;
+            float rscale = res_t >= 0 ? sres.t.scale : 0.0;
+            for (uint u = 0u; u < 4u; ++u) {
+                uint r = u / (4u / RT), nb = u % (4u / RT), ocb = oc0 + nb * 16u;
+                int oy = oyb + int(wave * RT + r);
+                if (nb >= nblk) { ureg[u] = true; continue; }                                  
+                                                                                                          
+                bool ok = nb < nblk && (((out_coff + ocb) * esz) & 3u) == 0u &&
+                          (ocb + 16u <= out_c || (out_coff + out_c == to.c && out_coff + ocb + 16u <= to.c_alloc));
+                if (!ok) continue;
+                ureg[u] = true;
+                if (oy >= int(to.h)) continue;                                                       
+                uint rbase = res_t >= 0 ? segByteAddr(sres, row, oy, oxb, 0u) : 0u;
+                uint wa = tensorByteAddr(to, row, oy, oxb, out_coff + ocb) >> 2u, ws = (to.c_alloc * esz) >> 2u;
+                if (to.fmt == 2u) {
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> qv;
+                    coopMatPerElementNV(qv, acc[u], epi8, ocb, out_c, so, bo, act, inv, rfmt, rmode, rbase, rpx, rscale);
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> q8 = coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(qv);
+                    coopMatStore(q8, arena_u32, wa, ws, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> af = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[u]);
+                    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> yv;
+                    coopMatPerElementNV(yv, af, epif, ocb, out_c, so, bo, act, rfmt, rmode, rbase, rpx, rscale);
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> y16 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(yv);
+                    coopMatStore(y16, arena_u32, wa, ws, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            skip_lds = ureg[0] && ureg[1] && ureg[2] && ureg[3];
+            if (skip_lds && FUSE == 0u) return;
+        }
+    }
+#endif
+                                                                                                                      
+                                                                                                                       
+                                                                                                                     
+    if (!skip_lds)
+    for (uint h = 0u; h < 2u; ++h) {
+        if (h > 0u) barrier();                                                                 
+        for (uint k = 0u; k < 2u; ++k) {
+            uint u = 2u * h + k, nb = u % (4u / RT);
+            if (nb < nblk && !ureg[u]) coopMatStore(acc[u], sh, wave * 512u + k * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        uint tw = tid >> 5u, k = (tid >> 4u) & 1u, m = tid & 15u;
+        uint u = 2u * h + k, r = u / (4u / RT), nb = u % (4u / RT);
+        int oy = oyb + int(tw * RT + r), ox = oxb + int(m);
+        uint ocb = oc0 + nb * 16u;
+        if (nb >= nblk || ureg[u] || oy >= int(to.h) || ox >= int(to.w) || ocb >= out_c) continue;
+        uint cend = min(16u, out_c - ocb);
+        for (uint i = 0u; i < cend; ++i) {
+            uint oc = ocb + i;
+            float y = float(int(sh[tw * 512u + k * 256u + m * 16u + i])) * uintBitsToFloat(blob[so + oc]) + uintBitsToFloat(blob[bo + oc]);
+            if (res_t >= 0) {
+                float rr = segRead(sres, row, oy, ox, oc);
+                if (res_c < 0) y += rr;
+                y = act == 1 ? leaky(y) : (act == 2 ? max(y, 0.0) : y);
+                if (res_c >= 0) y += rr;
+            } else {
+                y = act == 1 ? leaky(y) : (act == 2 ? max(y, 0.0) : y);
+            }
+            wput(to, row, oy, ox, out_coff + oc, y);
+        }
+        if (out_coff + ocb + cend == to.c) wzeroPad(to, row, oy, ox);
+        wflush();
+    }
+#ifdef MLOF2_EPI_REG
+    if (FUSE != 0u) {
+                                                                                                                        
+                                                                                                                    
+                                                                                                                     
+                                     
+        barrier();                                                                           
+        uint ob2 = pc.ob + (pc.op + FUSE) * 24u;
+        Tensor to2 = tensorAt(meta[ob2 + OP_OUT]);
+        uint coff2 = meta[ob2 + OP_OUT_COFF], oc2n = meta[ob2 + OP_OUT_C];
+        uint w2 = meta[ob2 + OP_W_OFF], kw2 = meta[ob2 + OP_KW_WORDS], so2 = meta[ob2 + OP_SCALE_OFF], bo2 = meta[ob2 + OP_BIAS_OFF];
+        int act2 = int(meta[ob2 + OP_IP + 5u]);
+        float inv1 = 1.0 / to.scale, inv2 = 1.0 / to2.scale;
+        uint rfmt = res_t >= 0 ? sres.t.fmt : 0xFu, rmode = res_c < 0 ? 1u : 0u;
+        uint resz = rfmt == 0u ? 4u : (rfmt == 1u ? 2u : 1u), rpx = res_t >= 0 ? sres.t.c_alloc * resz : 0u;
+        float rscale = res_t >= 0 ? sres.t.scale : 0.0;
+        uint esz2 = to2.fmt == 1u ? 2u : 1u;
+        bool tile2 = (to2.fmt == 2u || to2.fmt == 1u) && oxb + 16 <= int(to2.w) && ((to2.c_alloc * esz2) & 3u) == 0u;
+        uint nb2 = (oc2n + 15u) / 16u;
+        uint lane = tid & 31u;
+        for (uint r = 0u; r < RT; ++r) {
+            int oy = oyb + int(wave * RT + r);
+            bool rowok = oy < int(to.h);                                                                                        
+            uint rbase = res_t >= 0 ? segByteAddr(sres, row, oy, oxb, 0u) : 0u;
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a1[4u / RT];
+            for (uint k = 0u; k < 4u / RT; ++k) {                                                                  
+                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> qv;
+                coopMatPerElementNV(qv, acc[r * (4u / RT) + k], epi8, oc0 + k * 16u, out_c, so, bo, act, inv1, rfmt, rmode, rbase, rpx, rscale);
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> q8 = coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(qv);
+                a1[k] = coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>(q8);
+            }
+            for (uint n2 = 0u; n2 < 8u; ++n2) {
+                if (n2 >= nb2) break;
+                uint ocb2 = n2 * 16u;
+                coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2 = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+                for (uint k = 0u; k < 4u / RT; ++k) {
+                    if (k < nblk) {                                                               
+                        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b2;
+                        coopMatLoad(b2, blob, w2 + ocb2 * kw2 + k * 4u, kw2, gl_CooperativeMatrixLayoutColumnMajor);
+                        c2 = coopMatMulAdd(a1[k], b2, c2);
+                    }
+                }
+                bool ok = tile2 && (((coff2 + ocb2) * esz2) & 3u) == 0u &&
+                          (ocb2 + 16u <= oc2n || (coff2 + oc2n == to2.c && coff2 + ocb2 + 16u <= to2.c_alloc));
+                if (!rowok) {
+                } else if (ok) {
+                    uint wa = tensorByteAddr(to2, row, oy, oxb, coff2 + ocb2) >> 2u, ws = (to2.c_alloc * esz2) >> 2u;
+                    if (to2.fmt == 2u) {
+                        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> q2;
+                        coopMatPerElementNV(q2, c2, epi8, ocb2, oc2n, so2, bo2, act2, inv2, 0xFu, 0u, 0u, 0u, 0.0);
+                        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> q28 = coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(q2);
+                        coopMatStore(q28, arena_u32, wa, ws, gl_CooperativeMatrixLayoutRowMajor);
+                    } else {
+                        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> f2 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(c2);
+                        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> y2;
+                        coopMatPerElementNV(y2, f2, epif, ocb2, oc2n, so2, bo2, act2, 0xFu, 0u, 0u, 0u, 0.0);
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h2 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(y2);
+                        coopMatStore(h2, arena_u32, wa, ws, gl_CooperativeMatrixLayoutRowMajor);
+                    }
+                } else {                                                                                           
+                    coopMatStore(c2, sh, wave * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                    subgroupMemoryBarrierShared(); subgroupBarrier();
+                    uint m = lane & 15u, hh = lane >> 4u;
+                    int ox = oxb + int(m);
+                    uint clo = ocb2 + hh * 8u;
+                    if (ox < int(to2.w) && clo < oc2n) {
+                        uint cend = min(8u, oc2n - clo);
+                        for (uint i = 0u; i < cend; ++i) {
+                            uint oc = clo + i;
+                            float y = float(int(sh[wave * 256u + m * 16u + hh * 8u + i])) * uintBitsToFloat(blob[so2 + oc]) + uintBitsToFloat(blob[bo2 + oc]);
+                            y = act2 == 1 ? leaky(y) : (act2 == 2 ? max(y, 0.0) : y);
+                            wput(to2, row, oy, ox, coff2 + oc, y);
+                        }
+                        if (clo + cend == oc2n && coff2 + oc2n == to2.c) wzeroPad(to2, row, oy, ox);
+                        wflush();
+                    }
+                    subgroupMemoryBarrierShared(); subgroupBarrier();                                            
+                }
+            }
+        }
+    }
+#endif
+}

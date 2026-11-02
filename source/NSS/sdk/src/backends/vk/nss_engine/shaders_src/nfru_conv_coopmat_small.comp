@@ -1,0 +1,176 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+
+                                                                                                
+                                                                                                
+                                                                                             
+                                                                                                
+                                                                                                
+                                                                                                  
+                                                                                             
+                                     
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint kSubgroupSize = 32;
+
+layout(push_constant) uniform PushConstants {
+    uint in_width;
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint in_channels;
+    uint out_channels;
+    int  pad_t;
+    int  pad_l;
+    int  stride_y;
+    int  stride_x;
+    uint kh;
+    uint kw;
+    int  out_zp;
+    int  mult;
+    int  shift;
+    uint upsample;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer   { uvec4 in_data[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer { uint out_data[]; };
+layout(std430, set = 0, binding = 2) readonly buffer WeightWordBuffer { uint weight_words[]; };
+layout(std430, set = 0, binding = 3) readonly buffer BiasBuffer    { int32_t bias_data[]; };
+
+#define PT 4
+#define OCT 2
+#define TW 16
+#define NPMAX 18                                                              
+
+shared uvec4   lds_row[PT * NPMAX];
+shared int32_t lds_tile_c[256];
+shared int32_t lds_bias[16 * OCT];
+
+uvec4 loadInPixel(uint y, uint x, uint ic_t, uint ic_tiles) {
+    const uint p_in = (pc.upsample != 0u) ? ((y >> 1) * (pc.in_width >> 1) + (x >> 1)) : (y * pc.in_width + x);
+    return in_data[p_in * ic_tiles + ic_t];
+}
+
+void main() {
+    const uint oct_base = gl_WorkGroupID.y * OCT;
+    const uint lane_id  = gl_SubgroupInvocationID;
+    const uint SG = kSubgroupSize;
+
+    const uint nbx = (pc.out_width + TW - 1u) / TW;
+    const uint bx  = gl_WorkGroupID.x % nbx;
+    const uint by  = gl_WorkGroupID.x / nbx;
+    const uint x0  = bx * TW;
+    const uint y0  = by * PT;
+
+    const uint ic_tiles = pc.in_channels / 16u;
+    const uint oc_tiles = (pc.out_channels + 15u) / 16u;
+
+    for (uint i = lane_id; i < 16u * OCT; i += SG) {
+        const uint cur_oc = oct_base * 16u + i;
+        lds_bias[i] = (cur_oc < pc.out_channels) ? bias_data[cur_oc] : 0;
+    }
+
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC[PT * OCT];
+    for (uint i = 0; i < PT * OCT; ++i)
+        matC[i] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    const bool oc1_valid = (oct_base + 1u) < oc_tiles;
+
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    const uint sx = uint(pc.stride_x);
+    const uint NP = (TW - 1u) * sx + pc.kw;                                                     
+
+    const uint NSLOT = (PT * NPMAX + kSubgroupSize - 1u) / kSubgroupSize;
+    int  st_rowbase[NSLOT];
+    int  st_x[NSLOT];
+    uint st_dst[NSLOT];
+    bool st_live[NSLOT];
+    [[unroll]] for (uint sl = 0; sl < NSLOT; ++sl) {
+        const uint j   = lane_id + sl * SG;
+        const bool inr = j < PT * NP;
+        const uint t   = inr ? j / NP : 0u;
+        const uint jj  = inr ? j - t * NP : 0u;
+        const int  xg  = int(x0 * sx) - pc.pad_l + int(jj);
+        st_live[sl]    = inr && ((y0 + t) < pc.out_height) && (xg >= 0) && (xg < int(pc.in_width));
+        st_rowbase[sl] = int(y0 + t) * pc.stride_y - pc.pad_t;
+        st_x[sl]       = xg;
+        st_dst[sl]     = inr ? (t * NP + jj) : 0u;
+    }
+
+    for (uint ky = 0u; ky < pc.kh; ++ky) {
+        for (uint ic_t = 0u; ic_t < ic_tiles; ++ic_t) {
+            [[unroll]] for (uint sl = 0; sl < NSLOT; ++sl) {
+                const uint j = lane_id + sl * SG;
+                if (j < PT * NP) {
+                    const int iy = st_rowbase[sl] + int(ky);
+                    uvec4 v = uvec4(0x80808080u);
+                    if (st_live[sl] && iy >= 0 && iy < int(pc.in_height))
+                        v = loadInPixel(uint(iy), uint(st_x[sl]), ic_t, ic_tiles);
+                    lds_row[st_dst[sl]] = v;
+                }
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+
+            for (uint kx = 0u; kx < pc.kw; ++kx) {
+                const uint wbase = (((ky * pc.kw + kx) * ic_tiles + ic_t) * oc_tiles + oct_base) * 256u;
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB0;
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB1;
+                coopMatLoad(matB0, weight_words, wbase >> 2, 4, gl_CooperativeMatrixLayoutRowMajor);
+                if (oc1_valid)
+                    coopMatLoad(matB1, weight_words, (wbase + 256u) >> 2, 4, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint t = 0; t < PT; ++t) {
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+                    coopMatLoad(matA, lds_row, t * NP + kx, sx, gl_CooperativeMatrixLayoutRowMajor);
+                    matC[t * OCT + 0] = coopMatMulAdd(matA, matB0, matC[t * OCT + 0]);
+                    if (oc1_valid)
+                        matC[t * OCT + 1] = coopMatMulAdd(matA, matB1, matC[t * OCT + 1]);
+                }
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+        }
+    }
+
+                                                                                   
+    for (uint o = 0; o < OCT; ++o) {
+        const uint tile_oc = (oct_base + o) * 16u;
+        if (tile_oc >= pc.out_channels) break;
+        const uint valid_oc = min(pc.out_channels - tile_oc, 16u);
+
+        for (uint t = 0; t < PT; ++t) {
+            if (y0 + t >= pc.out_height) break;
+            coopMatStore(matC[t * OCT + o], lds_tile_c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+
+            for (uint it = lane_id; it < 64u; it += SG) {
+                const uint rr = it >> 2;
+                const uint w  = it & 3u;
+                const uint ox = x0 + rr;
+                if (ox >= pc.out_width || w * 4u >= valid_oc) continue;
+                const uint p = (y0 + t) * pc.out_width + ox;
+                const uint out_base_u32 = p * (pc.out_channels / 4u) + (tile_oc / 4u) + w;
+                uint packed_word = 0u;
+                for (uint j = 0; j < 4u; ++j) {
+                    const uint c = w * 4u + j;
+                    if (c >= valid_oc) break;
+                    const int32_t acc = lds_tile_c[rr * 16u + c] + lds_bias[o * 16u + c];
+                    int32_t hi, lo;
+                    imulExtended(acc, pc.mult, hi, lo);
+                    const int32_t val = ((hi + (1 << (pc.shift - 33))) >> (pc.shift - 32)) + pc.out_zp;
+                    packed_word |= (uint(clamp(val, -128, 127)) & 0xFFu) << (8u * j);
+                }
+                out_data[out_base_u32] = packed_word;
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+        }
+    }
+}

@@ -1,0 +1,77 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "nfru_select_common.h"
+layout(set = 0, binding = 0, std430) readonly buffer Cand { uint cand[]; };
+layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D outImage;
+layout(set = 0, binding = 3, std430) readonly buffer Logits { uint lg[]; };
+
+vec4 unpackInt8_ch03(uint w)
+{
+    return vec4(float(int(w << 24u) >> 24),
+                float(int((w << 16u) & 0xff000000u) >> 24),
+                float(int((w << 8u) & 0xff000000u) >> 24),
+                float(int(w & 0xff000000u) >> 24));
+}
+
+vec2 unpackInt8_ch45(uint w)
+{
+    return vec2(float(int(w << 24u) >> 24),
+                float(int((w << 16u) & 0xff000000u) >> 24));
+}
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.fw || p.y >= pc.fh) return;
+    uint base = (p.y * pc.fw + p.x) * 6u;
+    uint c5_raw = cand[base + 5u];
+    if (c5_raw == 0xffffffffu) return;
+
+    uint x0, x1, y0, y1; float lx, ly;
+    nfruLinear(p.x, pc.fw, pc.w, x0, x1, lx);
+    nfruLinear(p.y, pc.fh, pc.h, y0, y1, ly);
+
+    uint t00 = (y0 * pc.iw + x0) * 2u;
+    uint t01 = (y0 * pc.iw + x1) * 2u;
+    uint t10 = (y1 * pc.iw + x0) * 2u;
+    uint t11 = (y1 * pc.iw + x1) * 2u;
+
+    vec4 ch03_00 = unpackInt8_ch03(lg[t00]);
+    vec4 ch03_01 = unpackInt8_ch03(lg[t01]);
+    vec4 ch03_10 = unpackInt8_ch03(lg[t10]);
+    vec4 ch03_11 = unpackInt8_ch03(lg[t11]);
+    vec4 v03 = mix(mix(ch03_00, ch03_01, lx), mix(ch03_10, ch03_11, lx), ly);
+
+    vec2 ch45_00 = unpackInt8_ch45(lg[t00 + 1u]);
+    vec2 ch45_01 = unpackInt8_ch45(lg[t01 + 1u]);
+    vec2 ch45_10 = unpackInt8_ch45(lg[t10 + 1u]);
+    vec2 ch45_11 = unpackInt8_ch45(lg[t11 + 1u]);
+    vec2 v45 = mix(mix(ch45_00, ch45_01, lx), mix(ch45_10, ch45_11, lx), ly);
+
+    const float s_factor = uintBitsToFloat(pc.wofs) * (1.0 / 6.0);
+    float l0 = 6.0 * tanh(v03.x * s_factor);
+    float l1 = 6.0 * tanh(v03.y * s_factor);
+    float l2 = 6.0 * tanh(v03.z * s_factor);
+    float l3 = 6.0 * tanh(v03.w * s_factor);
+    float l4 = 6.0 * tanh(v45.x * s_factor);
+    float l5 = 6.0 * tanh(v45.y * s_factor);
+
+    float m = max(max(max(l0, l1), max(l2, l3)), max(l4, l5));
+    float e0 = exp(l0 - m);
+    float e1 = exp(l1 - m);
+    float e2 = exp(l2 - m);
+    float e3 = exp(l3 - m);
+    float e4 = exp(l4 - m);
+    float e5 = exp(l5 - m);
+    float s = e0 + e1 + e2 + e3 + e4 + e5;
+
+    vec3 rgb = e0 * nfruUnpack(cand[base + 0u])
+             + e1 * nfruUnpack(cand[base + 1u])
+             + e2 * nfruUnpack(cand[base + 2u])
+             + e3 * nfruUnpack(cand[base + 3u])
+             + e4 * nfruUnpack(cand[base + 4u])
+             + e5 * nfruUnpack(c5_raw);
+
+    imageStore(outImage, ivec2(p), vec4(rgb / s, 1.0));
+}

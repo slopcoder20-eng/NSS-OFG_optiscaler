@@ -1,0 +1,250 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+                                          
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint kSubgroupSize = 32;
+
+                                         
+                                                                          
+#define SPECIALIZED_OCT 2u
+
+                            
+layout(push_constant) uniform PushConstants {
+    uint in_width;
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint in_channels;
+    uint out_channels;
+    int pad_y;
+    int pad_x;
+    int stride_y;
+    int stride_x;
+    int out_zp;
+    int has_table;
+    uint in1_channels;                                               
+    uint upsample;                      
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uvec4 in_data[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uint out_data[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer WeightWordBuffer {
+    uint weight_words[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer BiasBuffer {
+    int32_t bias_data[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer MultiplierBuffer {
+    int32_t multiplier_data[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer ShiftBuffer {
+    int32_t shift_data[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer TableBuffer {
+    int8_t table_data[];
+};
+
+layout(std430, set = 0, binding = 7) readonly buffer InputBuffer2 {
+    uvec4 in_data2[];
+};
+
+#define PT 4
+#define TW 16
+#define NPMAX (15 * 1 + 3)                                      
+
+                                   
+shared uvec4   lds_row[PT * NPMAX];                               
+
+                               
+shared int32_t lds_tile_c[PT * 16 * SPECIALIZED_OCT * 16];                  
+shared int32_t lds_bias[16 * SPECIALIZED_OCT];
+shared int32_t lds_mult[16 * SPECIALIZED_OCT];
+shared int32_t lds_shift[16 * SPECIALIZED_OCT];
+
+void main() {
+    const uint lane_id = gl_SubgroupInvocationID;
+    const uint SG = kSubgroupSize;
+
+    const uint nbx = (pc.out_width + TW - 1u) / TW;
+    const uint bx  = gl_WorkGroupID.x % nbx;
+    const uint by  = gl_WorkGroupID.x / nbx;
+    const uint x0  = bx * TW;
+    const uint y0  = by * PT;
+
+    const uint ic_tiles = (pc.in_channels + 15u) >> 4;
+    const uint oc_tiles = SPECIALIZED_OCT;
+
+                                           
+    const uint num_oc_ch = oc_tiles * 16u;
+    if (lane_id < num_oc_ch) {
+        if (lane_id < pc.out_channels) {
+            lds_bias[lane_id]  = bias_data[lane_id];
+            lds_mult[lane_id]  = multiplier_data[lane_id];
+            lds_shift[lane_id] = shift_data[lane_id];
+        } else {
+            lds_bias[lane_id]  = 0;
+            lds_mult[lane_id]  = 0;
+            lds_shift[lane_id] = 0;
+        }
+    }
+
+                   
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC[PT * SPECIALIZED_OCT];
+    [[unroll]] for (uint i = 0; i < PT * SPECIALIZED_OCT; ++i) {
+        matC[i] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    }
+
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    const uint NP = NPMAX;
+    const uint NSLOT = (PT * NPMAX + kSubgroupSize - 1u) / kSubgroupSize;
+    int  st_rowbase[NSLOT];
+    int  st_x[NSLOT];
+    uint st_dst[NSLOT];
+    bool st_live[NSLOT];
+
+                                              
+    [[unroll]] for (uint sl = 0; sl < NSLOT; ++sl) {
+        const uint j = lane_id + sl * SG;
+        const bool inr = (j < PT * NP);
+        const uint t  = inr ? (j / NP) : 0u;
+        const uint jj = inr ? (j - t * NP) : 0u;
+        const int px = int(x0) - pc.pad_x + int(jj);
+        st_live[sl]    = inr && ((y0 + t) < pc.out_height) && (px >= 0) && (px < int(pc.in_width));
+        st_rowbase[sl] = int(y0 + t) * pc.stride_y - pc.pad_y;
+        st_x[sl]       = px;
+        st_dst[sl]     = inr ? (t * NP + jj) : 0u;
+    }
+
+                                                                
+    const uint n1_tiles = (pc.in1_channels > 0u) ? (pc.in1_channels >> 4) : ic_tiles;
+    const uint n2_tiles = ic_tiles - n1_tiles;
+    const uint half_w = pc.in_width >> 1;
+
+                               
+    for (int ky = 0; ky < 3; ++ky) {
+        for (uint ic_t = 0; ic_t < ic_tiles; ++ic_t) {
+            const bool is_in1 = (ic_t < n1_tiles);
+            const uint sub_ic = is_in1 ? ic_t : (ic_t - n1_tiles);
+
+                                                             
+            [[unroll]] for (uint sl = 0; sl < NSLOT; ++sl) {
+                const uint j = lane_id + sl * SG;
+                if (j < PT * NP) {
+                    const int iy = st_rowbase[sl] + ky;
+                    uvec4 v = uvec4(0x80808080u);
+                    if (st_live[sl] && iy >= 0 && iy < int(pc.in_height)) {
+                        if (is_in1) {
+                                                                                
+                            uint p = (pc.upsample != 0u) ? ((uint(iy) >> 1) * half_w + (uint(st_x[sl]) >> 1))
+                                                         : (uint(iy) * pc.in_width + uint(st_x[sl]));
+                            v = in_data[p * n1_tiles + sub_ic];
+                        } else {
+                                                                          
+                            uint p = uint(iy) * pc.in_width + uint(st_x[sl]);
+                            v = in_data2[p * n2_tiles + sub_ic];
+                        }
+                    }
+                    lds_row[st_dst[sl]] = v;
+                }
+            }
+
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+
+                                           
+            [[unroll]] for (int kx = 0; kx < 3; ++kx) {
+                                                          
+                uint w_tile_idx = ((ky * 3 + kx) * ic_tiles + ic_t) * oc_tiles;
+                uint wbase_word = w_tile_idx * 64u;                               
+
+                [[unroll]] for (uint oct = 0; oct < SPECIALIZED_OCT; ++oct) {
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+                    coopMatLoad(matB, weight_words, (wbase_word + oct * 64u), 4, gl_CooperativeMatrixLayoutRowMajor);
+
+                    [[unroll]] for (uint t = 0; t < PT; ++t) {
+                        coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+                        coopMatLoad(matA, lds_row, t * NP + uint(kx), 1u, gl_CooperativeMatrixLayoutRowMajor);
+                        matC[t * SPECIALIZED_OCT + oct] = coopMatMulAdd(matA, matB, matC[t * SPECIALIZED_OCT + oct]);
+                    }
+                }
+            }
+
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+        }
+    }
+
+                                                                       
+    [[unroll]] for (uint t = 0; t < PT; ++t) {
+        if ((y0 + t) < pc.out_height) {
+            [[unroll]] for (uint oct = 0; oct < SPECIALIZED_OCT; ++oct) {
+                uint lds_offset = (t * SPECIALIZED_OCT + oct) * 256u;
+                coopMatStore(matC[t * SPECIALIZED_OCT + oct], lds_tile_c, lds_offset, 16, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+                                
+    const uint total_work = PT * (16u * SPECIALIZED_OCT) * 4u;           
+    const uint out_words_per_pix = pc.out_channels >> 2;
+
+    for (uint it = lane_id; it < total_work; it += SG) {
+        uint t   = it / (16u * SPECIALIZED_OCT * 4u);
+        uint rem = it % (16u * SPECIALIZED_OCT * 4u);
+        uint rr  = rem / (SPECIALIZED_OCT * 4u);                      
+        uint oct_w = rem % (SPECIALIZED_OCT * 4u);
+        uint oct = oct_w >> 2;
+        uint w   = oct_w & 3u;
+        uint ox  = x0 + rr;
+
+        if ((y0 + t) >= pc.out_height || ox >= pc.out_width) continue;
+
+        uint c_base = oct * 16u + w * 4u;
+        if (c_base >= pc.out_channels) continue;
+
+        uint p = (y0 + t) * pc.out_width + ox;
+        uint out_idx = p * out_words_per_pix + (c_base >> 2);
+        uint tile_offset = (t * SPECIALIZED_OCT + oct) * 256u + rr * 16u;
+
+        uint packed_word = 0u;
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            uint c = c_base + j;
+            if (c >= pc.out_channels) break;
+
+            int32_t acc = lds_tile_c[tile_offset + w * 4u + j] + lds_bias[c];
+            int32_t shift = lds_shift[c];
+            int32_t hi, lo;
+            imulExtended(acc, lds_mult[c], hi, lo);
+            int32_t val = ((hi + (1 << (shift - 33))) >> (shift - 32)) + pc.out_zp;
+            int8_t clamped = int8_t(clamp(val, -128, 127));
+            if (pc.has_table != 0) {
+                clamped = table_data[uint(int(clamped) + 128)];
+            }
+            packed_word |= (uint(clamped) & 0xFFu) << (8u * j);
+        }
+        out_data[out_idx] = packed_word;
+    }
+}

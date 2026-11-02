@@ -1,0 +1,211 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+                                                    
+                                                                                
+                                                      
+                                                                                            
+                                                                                   
+                                                          
+                                                                                              
+                                                                               
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+                                                                             
+shared float16_t lds_wa[26][26];
+shared float16_t lds_wb[26][26];
+
+shared f16vec4   lds_q0[24][24];                             
+shared float16_t lds_q1[24][24];          
+
+shared f16vec4   lds_h0[24][16];                            
+shared float16_t lds_h1[24][16];                            
+
+float warpLumaFast(Seg s, float u, float v) {
+    float x0f = floor(u), y0f = floor(v);
+    float ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    int W = int(s.t.w), H = int(s.t.h);
+
+    if (x0 >= 0 && x0 + 1 < W && y0 >= 0 && y0 + 1 < H) {
+        uint r0 = (s.t.base >> 2u) + uint(y0) * s.t.w;
+        uint r1 = r0 + s.t.w;
+        float p00 = unpackHalf2x16(arena_u32[r0 + uint(x0)]).x;
+        float p01 = unpackHalf2x16(arena_u32[r0 + uint(x0 + 1)]).x;
+        float p10 = unpackHalf2x16(arena_u32[r1 + uint(x0)]).x;
+        float p11 = unpackHalf2x16(arena_u32[r1 + uint(x0 + 1)]).x;
+        return (1.0 - ay) * ((1.0 - ax) * p00 + ax * p01) + ay * ((1.0 - ax) * p10 + ax * p11);
+    }
+
+    float p00 = 0.0, p01 = 0.0, p10 = 0.0, p11 = 0.0;
+    if (y0 >= 0 && y0 < H) {
+        uint base_u32 = (s.t.base >> 2u) + uint(y0) * s.t.w;
+        if (x0 >= 0 && x0 < W) p00 = unpackHalf2x16(arena_u32[base_u32 + uint(x0)]).x;
+        if (x0 + 1 >= 0 && x0 + 1 < W) p01 = unpackHalf2x16(arena_u32[base_u32 + uint(x0 + 1)]).x;
+    }
+    if (y0 + 1 >= 0 && y0 + 1 < H) {
+        uint base_u32 = (s.t.base >> 2u) + uint(y0 + 1) * s.t.w;
+        if (x0 >= 0 && x0 < W) p10 = unpackHalf2x16(arena_u32[base_u32 + uint(x0)]).x;
+        if (x0 + 1 >= 0 && x0 + 1 < W) p11 = unpackHalf2x16(arena_u32[base_u32 + uint(x0 + 1)]).x;
+    }
+    return (1.0 - ay) * ((1.0 - ax) * p00 + ax * p01) + ay * ((1.0 - ax) * p10 + ax * p11);
+}
+
+vec2 readFlow(Seg s, int y, int x) {
+    uint addr = (s.t.base >> 2u) + uint(y) * s.t.w + uint(x);
+    return unpackHalf2x16(arena_u32[addr]);
+}
+
+void main() {
+    Tensor to = tensorAt(opw(OP_OUT));                               
+    int W = int(to.w);
+    int H = int(to.h);
+
+    Seg s_a  = segAt(0u);                               
+    Seg s_b  = segAt(1u);                               
+    Seg s_fa = segAt(2u);                              
+    Seg s_fb = segAt(3u);                              
+
+    float t_val = fcf(FC_T);
+
+    int base_x = int(gl_WorkGroupID.x * 16u) - 5;
+    int base_y = int(gl_WorkGroupID.y * 16u) - 5;
+
+                                                                                
+    uint tid = gl_LocalInvocationIndex;
+    [[unroll]]
+    for (uint i = tid; i < 676u; i += 256u) {
+        int ly = int(i / 26u);
+        int lx = int(i - uint(ly) * 26u);
+        int gx = clamp(base_x + lx, 0, W - 1);
+        int gy = clamp(base_y + ly, 0, H - 1);
+
+        vec2 fa = readFlow(s_fa, gy, gx);
+        vec2 fb = readFlow(s_fb, gy, gx);
+
+        float wa = warpLumaFast(s_a, float(gx) + fa.x, float(gy) + fa.y);
+        float wb = warpLumaFast(s_b, float(gx) + fb.x, float(gy) + fb.y);
+
+        lds_wa[ly][lx] = float16_t(wa);
+        lds_wb[ly][lx] = float16_t(wb);
+    }
+
+    barrier();
+
+                                                                              
+    [[unroll]]
+    for (uint i = tid; i < 576u; i += 256u) {
+        int ly = int(i / 24u);
+        int lx = int(i - uint(ly) * 24u);
+
+        int x_tap = clamp(base_x + 1 + lx, 0, W - 1);
+        int y_tap = clamp(base_y + 1 + ly, 0, H - 1);
+        int xc = clamp(x_tap, 1, W - 2);
+        int yc = clamp(y_tap, 1, H - 2);
+        int lxc = 1 + lx + (xc - x_tap);
+        int lyc = 1 + ly + (yc - y_tap);
+
+        float ax = 0.5 * float(lds_wa[1 + ly][lxc + 1] - lds_wa[1 + ly][lxc - 1]);
+        float ay = 0.5 * float(lds_wa[lyc + 1][1 + lx] - lds_wa[lyc - 1][1 + lx]);
+
+        float bx = 0.5 * float(lds_wb[1 + ly][lxc + 1] - lds_wb[1 + ly][lxc - 1]);
+        float by = 0.5 * float(lds_wb[lyc + 1][1 + lx] - lds_wb[lyc - 1][1 + lx]);
+
+        float gx = (1.0 - t_val) * bx + t_val * ax;
+        float gy = (1.0 - t_val) * by + t_val * ay;
+        float e  = float(lds_wb[1 + ly][1 + lx] - lds_wa[1 + ly][1 + lx]);
+
+        lds_q0[ly][lx] = f16vec4(gx * gx, gy * gy, gx * gy, gx * e);
+        lds_q1[ly][lx] = float16_t(gy * e);
+    }
+
+    barrier();
+
+                                                                                 
+    [[unroll]]
+    for (uint i = tid; i < 384u; i += 256u) {
+        int row = int(i / 16u);
+        int col = int(i - uint(row) * 16u);
+
+        vec4 h0 = vec4(0.0);
+        float h1 = 0.0;
+        [[unroll]]
+        for (int dx = 0; dx <= 8; ++dx) {
+            h0 += vec4(lds_q0[row][col + dx]);
+            h1 += float(lds_q1[row][col + dx]);
+        }
+        lds_h0[row][col] = f16vec4(h0);
+        lds_h1[row][col] = float16_t(h1);
+    }
+
+    barrier();
+
+                                                                   
+    int ox = int(gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x);
+    int oy = int(gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y);
+    if (ox >= W || oy >= H) return;
+
+    int lx = int(gl_LocalInvocationID.x);
+    int ly = int(gl_LocalInvocationID.y);
+
+    vec4 v0 = vec4(0.0);
+    float v1 = 0.0;
+    [[unroll]]
+    for (int dy = 0; dy <= 8; ++dy) {
+        v0 += vec4(lds_h0[ly + dy][lx]);
+        v1 += float(lds_h1[ly + dy][lx]);
+    }
+
+    float sxx = v0.x;
+    float syy = v0.y;
+    float sxy = v0.z;
+    float bxe = v0.w;
+    float bye = v1;
+
+                                                                   
+    float inv_count;
+    if (ox >= 4 && ox + 4 < W && oy >= 4 && oy + 4 < H) {
+        inv_count = 1.0 / 81.0;
+    } else {
+        int x_min = max(ox - 4, 0);
+        int x_max = min(ox + 4, W - 1);
+        int y_min = max(oy - 4, 0);
+        int y_max = min(oy + 4, H - 1);
+        inv_count = 1.0 / float((x_max - x_min + 1) * (y_max - y_min + 1));
+    }
+
+    sxx = sxx * inv_count + 1e-4;
+    syy = syy * inv_count + 1e-4;
+    sxy = sxy * inv_count;
+    bxe = bxe * inv_count;
+    bye = bye * inv_count;
+
+    float det = sxx * syy - sxy * sxy;
+    float ux = -(syy * bxe - sxy * bye) / det;
+    float uy = -(-sxy * bxe + sxx * bye) / det;
+
+    float n = sqrt(ux * ux + uy * uy);
+    if (n > 2.0) {
+        float sc = 2.0 / n;
+        ux *= sc;
+        uy *= sc;
+    }
+
+    vec2 fa_cur = readFlow(s_fa, oy, ox);
+    vec2 fb_cur = readFlow(s_fb, oy, ox);
+
+    vec2 fa_new = fa_cur - t_val * vec2(ux, uy);
+    vec2 fb_new = fb_cur + (1.0 - t_val) * vec2(ux, uy);
+
+                   
+    uint addr_fa = (to.base >> 2u) + uint(oy) * to.w + uint(ox);
+    arena_u32[addr_fa] = packHalf2x16(fa_new);
+
+                   
+    Tensor to_b = tensorAt(opw(OP_IP));
+    uint addr_fb = (to_b.base >> 2u) + uint(oy) * to_b.w + uint(ox);
+    arena_u32[addr_fb] = packHalf2x16(fb_new);
+}

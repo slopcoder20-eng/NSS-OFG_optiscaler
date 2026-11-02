@@ -1,0 +1,14 @@
+*.a -text
+*.lib -text
+*.dll -text
+*.exe -text
+*.so -text
+glslangValidator -text
+FidelityFX_SC -text
+Model_Parser -text
+sdk/libs/Debug/libSPIRV-Tools-android-arm.a -text
+sdk/libs/Debug/libSPIRV-Tools-opt-android-arm.a -text
+sdk/libs/libSPIRV-Tools-android-arm.a -text
+sdk/libs/libSPIRV-Tools-opt-android-arm.a -text
+samples/third_party/manifest.tsv text eol=lf
+samples/third_party/sparse.tsv text eol=lf

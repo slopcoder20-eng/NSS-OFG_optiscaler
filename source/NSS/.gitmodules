@@ -1,0 +1,12 @@
+[submodule "sdk/tools/ffx_shader_compiler/libs/SPIRV-Cross"]
+	path = sdk/tools/ffx_shader_compiler/libs/SPIRV-Cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross
+	branch = main
+[submodule "sdk/libs/SPIRV-Headers"]
+	path = sdk/libs/SPIRV-Headers
+	url = https://github.com/arm/SPIRV-Headers.git
+	branch = staging
+[submodule "sdk/libs/SPIRV-Tools"]
+	path = sdk/libs/SPIRV-Tools
+	url = https://github.com/arm/SPIRV-Tools.git
+	branch = staging

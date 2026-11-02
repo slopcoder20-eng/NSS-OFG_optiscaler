@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint total_pixels;
+    uint c1;
+    uint c2;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InBuffer1 {
+    int8_t in_data1[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer InBuffer2 {
+    int8_t in_data2[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer OutBuffer {
+    int8_t out_data[];
+};
+
+void main() {
+    uint p = gl_GlobalInvocationID.x;
+    if (p >= pc.total_pixels) {
+        return;
+    }
+
+    uint out_total_c = pc.c1 + pc.c2;
+    uint out_base = p * out_total_c;
+
+    uint in1_base = p * pc.c1;
+    for (uint i = 0; i < pc.c1; ++i) {
+        out_data[out_base + i] = in_data1[in1_base + i];
+    }
+
+    uint in2_base = p * pc.c2;
+    for (uint j = 0; j < pc.c2; ++j) {
+        out_data[out_base + pc.c1 + j] = in_data2[in2_base + j];
+    }
+}

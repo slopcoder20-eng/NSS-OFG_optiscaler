@@ -1,0 +1,169 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_GOOGLE_include_directive : enable
+
+                                                                         
+                                                                                     
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+shared int8_t  shA[256];
+shared int8_t  shB0[256];
+shared int8_t  shB1[256];
+shared int32_t shC[512];
+
+void main() {
+    Tensor to = tensorAt(opw(OP_OUT));                              
+    uint out_coff = opw(OP_OUT_COFF), out_c = opw(OP_OUT_C);
+    uint hw = to.h * to.w;
+    uint total_pix = to.n * hw;
+
+    uint pix0 = gl_WorkGroupID.x * 16u;
+    uint oc0  = gl_WorkGroupID.y * 32u;
+    if (pix0 >= total_pix || oc0 >= out_c) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    bool has_oc1 = (oc0 + 16u < out_c);
+
+    int kh = opi(0), kw = opi(1), stride = opi(2), pad = opi(3), dil = opi(4), act = opi(5);
+    int res_t = opi(6), res_c = opi(7);
+    float inv_s = opf(0);
+    uint w_off = opw(OP_W_OFF), kw_words = opw(OP_KW_WORDS);
+    uint icw = kw_words / uint(kh * kw);                             
+
+                                                                 
+    Tensor t_col = tensorAt(0u);
+    Tensor t_dep = tensorAt(1u);
+
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAcc0;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matAcc1;
+    matAcc0 = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    matAcc1 = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    for (int ky = 0; ky < kh; ++ky) {
+        for (int kx = 0; kx < kw; ++kx) {
+            uint tap = uint(ky * kw + kx);
+
+                                                               
+            for (uint c_tile = 0u; c_tile < 64u; c_tile += 16u) {
+                                                                      
+                for (uint i = 0u; i < 8u; ++i) {
+                    uint elem = tid * 8u + i;
+                    uint p_sub = elem / 16u;
+                    uint c_sub = elem % 16u;
+                    uint p_curr = pix0 + p_sub;
+                    uint c_curr = c_tile + c_sub;         
+
+                    int8_t q_val = int8_t(0);
+                    if (p_curr < total_pix && c_curr < 64u) {
+                        uint row = p_curr / hw;
+                        uint rem = p_curr % hw;
+                        int oy = int(rem / to.w);
+                        int ox = int(rem % to.w);
+                        int iy = oy * stride - pad + ky * dil;
+                        int ix = ox * stride - pad + kx * dil;
+
+                                               
+                        if (iy >= 0 && ix >= 0 && iy < int(to.h) && ix < int(to.w)) {
+                                                                          
+                                                                          
+                                                                             
+                            uint c_raw = c_curr / 16u;
+                            uint sub = c_curr % 16u;
+                            int dy = int(sub / 4u);
+                            int dx = int(sub % 4u);
+                            int src_y = iy * 4 + dy;
+                            int src_x = ix * 4 + dx;
+
+                            float v = 0.0;
+                            if (c_raw < 3u) {
+                                v = tensorRead(t_col, row, src_y, src_x, c_raw);
+                            } else {
+                                v = tensorRead(t_dep, row, src_y, src_x, 0u);
+                            }
+                            int q = int(clamp(roundEven(v * inv_s), -127.0, 127.0));
+                            q_val = int8_t(q);
+                        }
+                    }
+                    shA[elem] = q_val;
+                }
+
+                                                      
+                for (uint i = 0u; i < 8u; ++i) {
+                    uint elem = tid * 8u + i;
+                    uint oc_sub = elem / 16u;
+                    uint ic_sub = elem % 16u;
+                    uint ic_curr = c_tile + ic_sub;
+
+                    uint oc_curr0 = oc0 + oc_sub;
+                    int8_t w0 = int8_t(0);
+                    if (oc_curr0 < out_c && ic_curr < 64u) {
+                        uint gw = ic_curr / 4u;
+                        uint byte_off = ic_curr % 4u;
+                        uint wv = blob[w_off + oc_curr0 * kw_words + tap * icw + gw];
+                        w0 = int8_t((wv >> (8u * byte_off)) & 0xFFu);
+                    }
+                    shB0[elem] = w0;
+
+                    uint oc_curr1 = oc0 + 16u + oc_sub;
+                    int8_t w1 = int8_t(0);
+                    if (has_oc1 && oc_curr1 < out_c && ic_curr < 64u) {
+                        uint gw = ic_curr / 4u;
+                        uint byte_off = ic_curr % 4u;
+                        uint wv = blob[w_off + oc_curr1 * kw_words + tap * icw + gw];
+                        w1 = int8_t((wv >> (8u * byte_off)) & 0xFFu);
+                    }
+                    shB1[elem] = w1;
+                }
+
+                barrier();
+
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+                coopMatLoad(matA, shA, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB0;
+                coopMatLoad(matB0, shB0, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+                matAcc0 = coopMatMulAdd(matA, matB0, matAcc0);
+
+                if (has_oc1) {
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB1;
+                    coopMatLoad(matB1, shB1, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+                    matAcc1 = coopMatMulAdd(matA, matB1, matAcc1);
+                }
+
+                barrier();
+            }
+        }
+    }
+
+    coopMatStore(matAcc0, shC, 0, 32, gl_CooperativeMatrixLayoutRowMajor);
+    if (has_oc1) {
+        coopMatStore(matAcc1, shC, 16, 32, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    uint so = opw(OP_SCALE_OFF), bo = opw(OP_BIAS_OFF);
+    for (uint i = 0u; i < 16u; ++i) {
+        uint elem = tid * 16u + i;
+        uint p_sub = elem / 32u;
+        uint oc_sub = elem % 32u;
+        uint p_curr = pix0 + p_sub;
+        uint oc_curr = oc0 + oc_sub;
+
+        if (p_curr < total_pix && oc_curr < out_c) {
+            uint row = p_curr / hw;
+            uint rem = p_curr % hw;
+            int acc = shC[elem];
+            float y = float(acc) * uintBitsToFloat(blob[so + oc_curr]) + uintBitsToFloat(blob[bo + oc_curr]);
+            y = act == 1 ? leaky(y) : (act == 2 ? max(y, 0.0) : y);
+            int oy = int(rem / to.w), ox = int(rem % to.w);
+            tensorWrite(to, row, oy, ox, out_coff + oc_curr, y);
+            if (out_coff + oc_curr + 1u == to.c) tensorZeroPad(to, row, oy, ox);
+        }
+    }
+}

@@ -1,0 +1,73 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 8, local_size_y = 8) in;
+#include "nfru_select_common.h"
+layout(set = 0, binding = 0, std430) readonly buffer Cand { uint cand[]; };
+layout(set = 0, binding = 2, std430) writeonly buffer Feat { uint feat[]; };                                                
+
+uint packInt8x4(vec4 v)
+{
+    ivec4 q = clamp(ivec4(round(v * 15.9375)), 0, 255) - 128;
+    return (uint(q.x) & 0xffu) | ((uint(q.y) & 0xffu) << 8u) | ((uint(q.z) & 0xffu) << 16u) | ((uint(q.w) & 0xffu) << 24u);
+}
+
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.w || p.y >= pc.h) return;
+    if (p.x >= pc.iw || p.y >= pc.ih) {                                                          
+        uint o = (p.y * pc.w + p.x) * 8u;
+        for (uint w = 0u; w < 8u; ++w) feat[o + w] = 0x80808080u;
+        return;
+    }
+
+    vec3 sum_c0 = vec3(0.0), sum_c1 = vec3(0.0), sum_c2 = vec3(0.0);
+    vec3 sum_c3 = vec3(0.0), sum_c4 = vec3(0.0), sum_c5 = vec3(0.0);
+    vec3 sum_diff01 = vec3(0.0), sum_diff23 = vec3(0.0);
+    vec4 sum_maxd03 = vec4(0.0); float sum_maxd4 = 0.0;
+
+    for (uint dy = 0u; dy < 4u; ++dy) {
+        uint row_base = ((p.y * 4u + dy) * pc.fw + p.x * 4u) * 6u;
+        for (uint dx = 0u; dx < 4u; ++dx) {
+            uint base = row_base + dx * 6u;
+            vec3 c[6];
+            c[0] = clamp(nfruUnpack(cand[base + 0u]), 0.0, 1.0);
+            c[1] = clamp(nfruUnpack(cand[base + 1u]), 0.0, 1.0);
+            c[2] = clamp(nfruUnpack(cand[base + 2u]), 0.0, 1.0);
+            c[3] = clamp(nfruUnpack(cand[base + 3u]), 0.0, 1.0);
+            c[4] = clamp(nfruUnpack(cand[base + 4u]), 0.0, 1.0);
+            uint raw5 = cand[base + 5u];
+            c[5] = (raw5 == 0xffffffffu) ? c[4] : clamp(nfruUnpack(raw5), 0.0, 1.0);
+
+            sum_c0 += c[0]; sum_c1 += c[1]; sum_c2 += c[2];
+            sum_c3 += c[3]; sum_c4 += c[4]; sum_c5 += c[5];
+
+            vec3 d01 = abs(c[0] - c[1]);
+            vec3 d23 = abs(c[2] - c[3]);
+            sum_diff01 += d01;
+            sum_diff23 += d23;
+
+            vec3 d0 = abs(c[0] - c[5]);
+            vec3 d1 = abs(c[1] - c[5]);
+            vec3 d2 = abs(c[2] - c[5]);
+            vec3 d3 = abs(c[3] - c[5]);
+            vec3 d4 = abs(c[4] - c[5]);
+
+            sum_maxd03 += vec4(max(max(d0.r, d0.g), d0.b),
+                               max(max(d1.r, d1.g), d1.b),
+                               max(max(d2.r, d2.g), d2.b),
+                               max(max(d3.r, d3.g), d3.b));
+            sum_maxd4 += max(max(d4.r, d4.g), d4.b);
+        }
+    }
+
+    uint o = (p.y * pc.w + p.x) * 8u;
+    feat[o + 0u] = packInt8x4(vec4(sum_c0, sum_c1.r));
+    feat[o + 1u] = packInt8x4(vec4(sum_c1.gb, sum_c2.rg));
+    feat[o + 2u] = packInt8x4(vec4(sum_c2.b, sum_c3));
+    feat[o + 3u] = packInt8x4(vec4(sum_c4, sum_c5.r));
+    feat[o + 4u] = packInt8x4(vec4(sum_c5.gb, sum_diff01.rg));
+    feat[o + 5u] = packInt8x4(vec4(sum_diff01.b, sum_diff23));
+    feat[o + 6u] = packInt8x4(sum_maxd03);
+    feat[o + 7u] = (uint(clamp(int(round(sum_maxd4 * 15.9375)), 0, 255) - 128) & 0xffu) | 0x80808000u;
+}

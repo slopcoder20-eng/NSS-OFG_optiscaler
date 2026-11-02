@@ -1,0 +1,1818 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+                                                                                                                
+                                                                                                                               
+                                                                                                  
+#include "mlof2_common.glsl"
+#ifndef MLOF2_DX
+                                                                         
+                                                                           
+layout(constant_id = 8) const bool MLOF2_PREP_MV_ONLY = false;
+#else
+const bool MLOF2_PREP_MV_ONLY = false;
+#endif
+#ifndef MLOF2_DX
+layout(set = 0, binding = 3, rgba16f) uniform image2D uImgCabA;
+layout(set = 0, binding = 4, rgba16f) uniform image2D uImgCabB;
+layout(set = 0, binding = 5, rgba16f) uniform image2D uImgQpA;
+layout(set = 0, binding = 6, rgba16f) uniform image2D uImgQpB;
+
+layout(set = 0, binding = 7) uniform sampler2D uTexCabA;
+layout(set = 0, binding = 8) uniform sampler2D uTexCabB;
+layout(set = 0, binding = 9) uniform sampler2D uTexQpA;
+layout(set = 0, binding = 10) uniform sampler2D uTexQpB;
+
+                                                                                               
+layout(set = 1, binding = 0) uniform sampler2D uExtColB;
+layout(set = 1, binding = 1) uniform sampler2D uExtColA;
+layout(set = 1, binding = 2) uniform sampler2D uExtDepB;
+layout(set = 1, binding = 3) uniform sampler2D uExtDepA;
+layout(set = 1, binding = 4) uniform sampler2D uExtMv;
+layout(set = 1, binding = 5) uniform writeonly image2D uExtOut;                                        
+layout(set = 1, binding = 6) uniform sampler2D uExtFull;                                                                
+#endif
+                                                                                                                     
+                                                       
+ivec2 extTexel(int X, int Y, uint tw, uint th) {
+    uint dw = uint(fcf(FC_EXT_DISP_W)), dh = uint(fcf(FC_EXT_DISP_H));
+    uint cx = min(uint(max(X, 0)), dw - 1u), cy = min(uint(max(Y, 0)), dh - 1u);
+    return ivec2(min(uint((float(cx) + 0.5) * float(tw) / float(dw)), tw - 1u), min(uint((float(cy) + 0.5) * float(th) / float(dh)), th - 1u));
+}
+#ifndef MLOF2_DX
+                                                                                                                   
+                                                                                                                
+bool extIn() { return fcf(FC_EXT_IN) > 0.5; }
+float h16(float x) { return unpackHalf2x16(packHalf2x16(vec2(x, 0.0))).x; }
+vec3 extCol(bool b, int X, int Y) {
+    uint dw = uint(fcf(FC_EXT_DISP_W)), dh = uint(fcf(FC_EXT_DISP_H));
+    ivec2 p = ivec2(min(uint(max(X, 0)), dw - 1u), min(uint(max(Y, 0)), dh - 1u));
+    vec3 c = b ? texelFetch(uExtColB, p, 0).rgb : texelFetch(uExtColA, p, 0).rgb;
+    return vec3(h16(c.r), h16(c.g), h16(c.b));
+}
+vec2 extMvAt(int X, int Y) {                                                       
+    ivec2 t = extTexel(X, Y, uint(fcf(FC_EXT_MV_W)), uint(fcf(FC_EXT_MV_H)));
+    return texelFetch(uExtMv, t, 0).xy * vec2(fcf(FC_EXT_MV_SX), fcf(FC_EXT_MV_SY));
+}
+float extRawDepth(bool b, int X, int Y) {
+    ivec2 t = extTexel(X, Y, uint(fcf(FC_EXT_DEP_W)), uint(fcf(FC_EXT_DEP_H)));
+    return b ? texelFetch(uExtDepB, t, 0).r : texelFetch(uExtDepA, t, 0).r;
+}
+float extDepFeat(bool b, int X, int Y) {
+    float raw = extRawDepth(b, X, Y);
+    float d = fcf(FC_EXT_REVZ) > 0.5 ? (1.0 - raw) : raw;
+    d = clamp(d, 0.0, 1.0 - 1e-6);
+    return clamp(-log2(max(1.0 - d, 1e-6)) / 16.0, 0.0, 1.0);
+}
+float extNdcA(int X, int Y) {
+    float raw = extRawDepth(false, X, Y);
+    return fcf(FC_EXT_REVZ) > 0.5 ? clamp(raw, 0.0, 1.0) : (1.0 - clamp(raw, 0.0, 1.0));
+}
+                                                                                                    
+vec3 extColABil(float u, float v, uint w, uint h) {
+    float x0f = floor(u), y0f = floor(v), ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    vec3 c[4];
+    for (int j = 0; j < 4; ++j) {
+        int px = x0 + (j & 1), py = y0 + (j >> 1);
+        c[j] = (px >= 0 && py >= 0 && px < int(w) && py < int(h)) ? extCol(false, px, py) : vec3(0.0);
+    }
+    return (1.0 - ay) * ((1.0 - ax) * c[0] + ax * c[1]) + ay * ((1.0 - ax) * c[2] + ax * c[3]);
+}
+#endif
+                                                                                                                      
+vec2 extMvPrevAt(int X, int Y) {
+    uint mw = uint(fcf(FC_EXT_MV_W)), mh = uint(fcf(FC_EXT_MV_H));
+    ivec2 t = extTexel(X, Y, mw, mh);
+    uint b = floatBitsToUint(fcf(FC_EXT_MVAP_OFF)) + (uint(t.y) * mw + uint(t.x)) * 2u;
+    return vec2(uintBitsToFloat(arena_u32[b]), uintBitsToFloat(arena_u32[b + 1u]));
+}
+                                                               
+vec2 extMvPrevBil(float u, float v, uint w, uint h) {
+    float x0f = floor(u), y0f = floor(v), ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    vec2 r = vec2(0.0);
+    for (int j = 0; j < 4; ++j) {
+        int px = x0 + (j & 1), py = y0 + (j >> 1);
+        if (px >= 0 && py >= 0 && px < int(w) && py < int(h))
+            r += ((j & 1) != 0 ? ax : 1.0 - ax) * ((j >> 1) != 0 ? ay : 1.0 - ay) * extMvPrevAt(px, py);
+    }
+    return r;
+}
+                                                                                                                    
+                                                                                                                      
+#ifndef MLOF2_KIND
+#define MLOF2_KIND -1
+#endif
+#define IS(k) (kind == k && (MLOF2_KIND < 0 || MLOF2_KIND == k))
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+Tensor to;
+uint ohw, orem, out_coff;
+int oy, ox;
+void put(uint c, float v) { wput(to, 0u, oy, ox, out_coff + c, v); }                                                   
+
+#ifdef MLOF2_GEN_RED                                                                                         
+shared float sh_red[64 * 13];
+shared uint sh_hist[4096];
+shared float s_med;
+#ifndef MLOF2_DX
+layout(constant_id = 7) const int MLOF2_RED_KIND = -1;
+#endif
+#endif
+
+float lum3(Seg s, int y, int x) {
+    return 0.299 * segRead(s, 0u, y, x, 0u) + 0.587 * segRead(s, 0u, y, x, 1u) + 0.114 * segRead(s, 0u, y, x, 2u);
+}
+void vfeat(float X, float Y, float W, float H, out float f0, out float f1, out float f2) {
+    float dx = clamp(2.0 * X / (W - 1.0) - 1.0, -1.0, 1.0), dy = clamp(2.0 * Y / (H - 1.0) - 1.0, -1.0, 1.0);
+    float fx = dx * dx;
+    f0 = dx < 0.0 ? fx : 0.0; f1 = dx >= 0.0 ? fx : 0.0; f2 = dy * dy;
+}
+                                                         
+float vigV(Seg vg, float X, float Y, float W, float H) {
+    float f0, f1, f2; vfeat(X, Y, W, H, f0, f1, f2);
+    uint vg_base = vg.t.base >> 2u;
+    float c12 = uintBitsToFloat(arena_u32[vg_base + 12u]);
+    float c13 = uintBitsToFloat(arena_u32[vg_base + 13u]);
+    float c14 = uintBitsToFloat(arena_u32[vg_base + 14u]);
+    return exp(f0 * c12 + f1 * c13 + f2 * c14);
+}
+uint hashn(uint x, uint y, uint c, uint idx) {                                                 
+    uint h = x * 1973u + y * 9277u + c * 26699u + idx * 7919u + 12345u;
+    h = (h ^ (h >> 16)) * 0x7feb352du;
+    h = (h ^ (h >> 15)) * 0x846ca68bu;
+    return h ^ (h >> 16);
+}
+bool offFrameAt(int x, int y, float fx, float fy, uint w, uint h) {
+    float qx = float(x) + fx, qy = float(y) + fy;
+    return qx < -0.5 || qx > float(w) - 0.5 || qy < -0.5 || qy > float(h) - 0.5;
+}
+                                                                                                        
+float bilUp(Seg s, int x, int y, uint w, uint h, uint c) {
+    float fy = max((float(y) + 0.5) * float(s.t.h) / float(h) - 0.5, 0.0), fx = max((float(x) + 0.5) * float(s.t.w) / float(w) - 0.5, 0.0);
+    int y0 = int(fy), x0 = int(fx), y1 = min(y0 + 1, int(s.t.h) - 1), x1 = min(x0 + 1, int(s.t.w) - 1);
+    float ly = fy - float(y0), lx = fx - float(x0);
+    return (1.0 - ly) * ((1.0 - lx) * segRead(s, 0u, y0, x0, c) + lx * segRead(s, 0u, y0, x1, c)) +
+           ly * ((1.0 - lx) * segRead(s, 0u, y1, x0, c) + lx * segRead(s, 0u, y1, x1, c));
+}
+                                                                                                        
+void upAt(uint cw, uint chh, int x, int y, uint w, uint h, out ivec2 p0, out ivec2 p1, out vec2 l) {
+    float fy = max((float(y) + 0.5) * float(chh) / float(h) - 0.5, 0.0), fx = max((float(x) + 0.5) * float(cw) / float(w) - 0.5, 0.0);
+    p0 = ivec2(int(fx), int(fy)); p1 = ivec2(min(p0.x + 1, int(cw) - 1), min(p0.y + 1, int(chh) - 1));
+    l = vec2(fx - float(p0.x), fy - float(p0.y));
+}
+                                                       
+bool segWords(Seg s) { return s.t.fmt == 1u && ((s.c_off | s.t.c_alloc) & 1u) == 0u && (s.t.base & 3u) == 0u; }
+                                               
+vec4 bilUp4(Seg s, int x, int y, uint w, uint h) {
+    float fy = max((float(y) + 0.5) * float(s.t.h) / float(h) - 0.5, 0.0), fx = max((float(x) + 0.5) * float(s.t.w) / float(w) - 0.5, 0.0);
+    int y0 = int(fy), x0 = int(fx), y1 = min(y0 + 1, int(s.t.h) - 1), x1 = min(x0 + 1, int(s.t.w) - 1);
+    float ly = fy - float(y0), lx = fx - float(x0);
+    return (1.0 - ly) * ((1.0 - lx) * segRead4(s, 0u, y0, x0, 0u) + lx * segRead4(s, 0u, y0, x1, 0u)) +
+           ly * ((1.0 - lx) * segRead4(s, 0u, y1, x0, 0u) + lx * segRead4(s, 0u, y1, x1, 0u));
+}
+bool offFrame(float fx, float fy, uint w, uint h) {
+    float qx = float(ox) + fx, qy = float(oy) + fy;
+    return qx < -0.5 || qx > float(w) - 0.5 || qy < -0.5 || qy > float(h) - 0.5;
+}
+                                                                                                         
+bool g_accel; float g_t;
+vec2 dispAt(Seg f, Seg fbp, int y, int x) {
+    bool adj = g_accel && fbp.t.base == f.t.base && fbp.c_off == f.c_off + 2u;                                 
+    vec4 v4 = adj ? segRead4(f, 0u, y, x, 0u) : vec4(segRead2(f, 0u, y, x, 0u), 0.0, 0.0);
+    vec2 a0 = v4.xy;
+    vec2 d = (1.0 - g_t) * a0;
+    if (g_accel) {
+        vec2 a = (adj ? v4.zw : segRead2(fbp, 0u, y, x, 0u)) - 2.0 * a0;
+        float cap = 0.5 * length(a0);
+        a *= min(cap / max(length(a), 1e-6), 1.0);
+        d += 0.5 * a * g_t * (g_t - 1.0);
+    }
+    return d;
+}
+                                                                                                             
+int g_cstep = 1;                                                                                          
+vec2 camAt(Seg nd, int y, int x) {
+    int cw = int(nd.t.w) / g_cstep, chh = int(nd.t.h) / g_cstep;
+    bool in_ = x >= 0 && y >= 0 && x < cw && y < chh;                                          
+    float W = float(cw), H = float(chh), t = fcf(FC_T);
+#ifndef MLOF2_DX
+    float zn = extIn() ? extNdcA(4 * (clamp(x, 0, cw - 1) * g_cstep) + 1, 4 * (clamp(y, 0, chh - 1) * g_cstep) + 1)                                
+                       : segRead(nd, 0u, clamp(y, 0, chh - 1) * g_cstep, clamp(x, 0, cw - 1) * g_cstep, 0u);
+#else
+    float zn = segRead(nd, 0u, clamp(y, 0, chh - 1) * g_cstep, clamp(x, 0, cw - 1) * g_cstep, 0u);
+#endif
+    float cl[4] = float[4]((float(x) + 0.5) / W * 2.0 - 1.0, -((float(y) + 0.5) / H * 2.0 - 1.0), zn, 1.0);
+    float wd[4];
+    for (int j = 0; j < 4; ++j) { float a = 0.0; for (int i = 0; i < 4; ++i) a += cl[i] * fcf(FC_INV_VP_A + uint(i * 4 + j)); wd[j] = a; }
+    float c4[4];
+    for (int j = 0; j < 4; ++j) {
+        float a = 0.0;
+        for (int i = 0; i < 4; ++i) a += wd[i] * ((1.0 - t) * fcf(FC_VP_A + uint(i * 4 + j)) + t * fcf(FC_VP_B + uint(i * 4 + j)));
+        c4[j] = a;
+    }
+    vec2 r = vec2((c4[0] / c4[3] + 1.0) / 2.0 * W - 0.5 - float(x), (-c4[1] / c4[3] + 1.0) / 2.0 * H - 0.5 - float(y));
+    return in_ ? r : vec2(0.0);
+}
+ivec2 nearestB(vec2 q, uint w, uint h) { return clamp(ivec2(roundEven(q)), ivec2(0), ivec2(int(w) - 1, int(h) - 1)); }
+
+                                                                                                           
+vec4 bil4Z(Seg s, float u, float v) {
+    float x0f = floor(u), y0f = floor(v), ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    if (seg4h(s, 0u)) {                                                                                                     
+        int W = int(s.t.w), H = int(s.t.h);
+        float wx0 = x0 >= 0 && x0 < W ? 1.0 - ax : 0.0, wx1 = x0 + 1 >= 0 && x0 + 1 < W ? ax : 0.0;
+        float wy0 = y0 >= 0 && y0 < H ? 1.0 - ay : 0.0, wy1 = y0 + 1 >= 0 && y0 + 1 < H ? ay : 0.0;
+        int xa = clamp(x0, 0, W - 1), xb = clamp(x0 + 1, 0, W - 1), ya = clamp(y0, 0, H - 1), yb = clamp(y0 + 1, 0, H - 1);
+        vec4 t00 = segLd4h(s, 0u, ya, xa, 0u), t01 = segLd4h(s, 0u, ya, xb, 0u);
+        vec4 t10 = segLd4h(s, 0u, yb, xa, 0u), t11 = segLd4h(s, 0u, yb, xb, 0u);
+        return wy0 * (wx0 * t00 + wx1 * t01) + wy1 * (wx0 * t10 + wx1 * t11);
+    }
+    vec4 r = vec4(0.0);
+    for (int j = 0; j < 4; ++j) {
+        int px = x0 + (j & 1), py = y0 + (j >> 1);
+        if (px < 0 || py < 0 || px >= int(s.t.w) || py >= int(s.t.h)) continue;
+        r += ((j & 1) != 0 ? ax : 1.0 - ax) * ((j >> 1) != 0 ? ay : 1.0 - ay) * segRead4(s, 0u, py, px, 0u);
+    }
+    return r;
+}
+Seg sub(Seg s, uint c0, uint c) { s.c_off += c0; s.c = c; return s; }                                
+                                                                                                                 
+                                                                                                                          
+                                                                                                          
+vec2 ofUpAt(Seg s, int X, int Y, uint w, uint h) {
+    float fy = max((float(Y) + 0.5) * float(s.t.h) / float(h) - 0.5, 0.0), fx = max((float(X) + 0.5) * float(s.t.w) / float(w) - 0.5, 0.0);
+    int y0 = int(fy), x0 = int(fx), y1 = min(y0 + 1, int(s.t.h) - 1), x1 = min(x0 + 1, int(s.t.w) - 1);
+    float ly = fy - float(y0), lx = fx - float(x0);
+    vec2 a, b, c, d;
+    if (s.t.fmt == 0u && s.t.c_alloc == 2u) {
+        uint u_base = s.t.base >> 2u;
+        uint r0 = uint(y0) * s.t.w, r1 = uint(y1) * s.t.w;
+        uint ia = u_base + (r0 + uint(x0)) * 2u;
+        uint ib = u_base + (r0 + uint(x1)) * 2u;
+        uint ic = u_base + (r1 + uint(x0)) * 2u;
+        uint id = u_base + (r1 + uint(x1)) * 2u;
+        a = vec2(uintBitsToFloat(arena_u32[ia]), uintBitsToFloat(arena_u32[ia + 1u]));
+        b = vec2(uintBitsToFloat(arena_u32[ib]), uintBitsToFloat(arena_u32[ib + 1u]));
+        c = vec2(uintBitsToFloat(arena_u32[ic]), uintBitsToFloat(arena_u32[ic + 1u]));
+        d = vec2(uintBitsToFloat(arena_u32[id]), uintBitsToFloat(arena_u32[id + 1u]));
+    } else {
+        a = vec2(segRead(s, 0u, y0, x0, 0u), segRead(s, 0u, y0, x0, 1u));
+        b = vec2(segRead(s, 0u, y0, x1, 0u), segRead(s, 0u, y0, x1, 1u));
+        c = vec2(segRead(s, 0u, y1, x0, 0u), segRead(s, 0u, y1, x0, 1u));
+        d = vec2(segRead(s, 0u, y1, x1, 0u), segRead(s, 0u, y1, x1, 1u));
+    }
+    return ((1.0 - ly) * ((1.0 - lx) * a + lx * b) + ly * ((1.0 - lx) * c + lx * d)) * (float(w) / float(s.t.w));
+}
+                                                                                                       
+vec2 warpUpZ(Seg s, float u, float v, uint w, uint h) {
+    float x0f = floor(u), y0f = floor(v), ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    vec2 r = vec2(0.0);
+    for (int j = 0; j < 4; ++j) {
+        int px = x0 + (j & 1), py = y0 + (j >> 1);
+        bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);
+        float wt = in_ ? ((j & 1) != 0 ? ax : 1.0 - ax) * ((j >> 1) != 0 ? ay : 1.0 - ay) : 0.0;
+        r += wt * ofUpAt(s, clamp(px, 0, int(w) - 1), clamp(py, 0, int(h) - 1), w, h);
+    }
+    return r;
+}
+vec2 bil2Z(Seg s, float u, float v) {
+    float x0f = floor(u), y0f = floor(v), ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f), W = int(s.t.w), H = int(s.t.h);
+    vec2 r = vec2(0.0);
+    bool is_fp0_c2 = (s.t.fmt == 0u && s.t.c_alloc == 2u);
+    bool is_fp1_c2 = (s.t.fmt == 1u && s.t.c_alloc == 2u);
+    uint u_base = s.t.base >> 2u;
+    for (int j = 0; j < 4; ++j) {
+        int px = x0 + (j & 1), py = y0 + (j >> 1);
+        if (px >= 0 && py >= 0 && px < W && py < H) {
+            float wt = ((j & 1) != 0 ? ax : 1.0 - ax) * ((j >> 1) != 0 ? ay : 1.0 - ay);
+            vec2 val;
+            if (is_fp0_c2) {
+                uint idx = u_base + (uint(py) * s.t.w + uint(px)) * 2u;
+                val = vec2(uintBitsToFloat(arena_u32[idx]), uintBitsToFloat(arena_u32[idx + 1u]));
+            } else if (is_fp1_c2) {
+                uint idx = u_base + uint(py) * s.t.w + uint(px);
+                val = unpackHalf2x16(arena_u32[idx]);
+            } else {
+                val = vec2(segRead(s, 0u, py, px, 0u), segRead(s, 0u, py, px, 1u));
+            }
+            r += wt * val;
+        }
+    }
+    return r;
+}
+                                                                                                                   
+vec4 softmax4(vec4 l) { float mx = max(max(l.x, l.y), max(l.z, l.w)); vec4 e = exp(l - mx); return e / (e.x + e.y + e.z + e.w); }
+float qMoLuma(Seg lg, Seg qc, int x, int y) {
+    vec4 w = softmax4(segRead4(lg, 0u, y, x, 0u));
+    vec4 c0 = segRead4(qc, 0u, y, x, 0u), c1 = segRead4(qc, 0u, y, x, 4u);
+    vec3 a = c0.xyz, b = vec3(c0.w, c1.x, c1.y);
+    vec2 ma = vec2(segRead(qc, 0u, y, x, 12u), segRead(qc, 0u, y, x, 13u));
+    bool offa = offFrameAt(x, y, ma.x, ma.y, qc.t.w, qc.t.h), oob = segRead(qc, 0u, y, x, 22u) > 0.5;
+    float s2 = max(w.x + w.y, 1e-6);
+    vec3 mo = offa ? b : (oob ? a : (w.x / s2) * a + (w.y / s2) * b);
+    return dot(mo, vec3(0.299, 0.587, 0.114));
+}
+bool qOne(Seg qc, int x, int y) {
+    vec2 ma = vec2(segRead(qc, 0u, y, x, 12u), segRead(qc, 0u, y, x, 13u));
+    return offFrameAt(x, y, ma.x, ma.y, qc.t.w, qc.t.h) || segRead(qc, 0u, y, x, 22u) > 0.5;
+}
+                                                                                                                  
+float qBothFail(Seg r1, float med, int x, int y, float bm, float bw) {
+    vec4 r = segRead4(r1, 0u, y, x, 0u);
+    float k = r.z + med + 1e-3;
+    return 1.0 / (1.0 + exp(-((min(r.x, r.y) - bm * k) / (bw * k))));
+}
+float qScore(Seg r1, float med, int x, int y) {
+    vec4 r = segRead4(r1, 0u, y, x, 0u);                                              
+    float k = r.z + med + 1e-3;
+    return 1.0 / (1.0 + exp(-((r.x - r.y - 0.5 * k) / (0.25 * k))));
+}
+
+                                                                                                
+void invertT(Seg f, Seg fbp, bool useV, Seg vs, out float r[6]) {
+    uint w = f.t.w, h = f.t.h;
+    vec2 yv = vec2(float(ox), float(oy));
+    vec2 q = yv - dispAt(f, fbp, oy, ox);
+    for (int k = 0; k < 4; ++k) { ivec2 p = nearestB(q, w, h); q = yv - dispAt(f, fbp, p.y, p.x); }
+    ivec2 pq = nearestB(q, w, h);
+    vec2 rr = abs(q + dispAt(f, fbp, pq.y, pq.x) - yv);
+    bool inb = q.x >= 0.0 && q.x <= float(w) - 1.0 && q.y >= 0.0 && q.y <= float(h) - 1.0;
+    bool val = !useV || segRead(vs, 0u, pq.y, pq.x, 0u) > 0.5;
+    bool good = max(rr.x, rr.y) <= 1.0 && inb && val;
+    bool oob = q.x < -0.5 || q.x > float(w) - 0.5 || q.y < -0.5 || q.y > float(h) - 0.5;
+    vec2 q0 = floor(q), wq = q - q0;
+    vec2 fx = vec2(0.0), dx = vec2(0.0);
+    for (int j = 0; j < 4; ++j) {
+        int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+        bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);                                   
+        float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+        px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+        fx += wt * segRead2(f, 0u, py, px, 0u);
+        dx += wt * dispAt(f, fbp, py, px);
+    }
+    r[0] = fx.x - dx.x; r[1] = fx.y - dx.y; r[2] = -dx.x; r[3] = -dx.y; r[4] = good ? 0.0 : 1.0; r[5] = oob ? 1.0 : 0.0;
+}
+
+                                        
+void camInvert(Seg nd, out float r[6]) {
+    uint w = nd.t.w / uint(g_cstep), h = nd.t.h / uint(g_cstep);
+    vec2 yv = vec2(float(ox), float(oy));
+    vec2 q = yv - camAt(nd, oy, ox);
+    for (int k = 0; k < 4; ++k) { ivec2 p = nearestB(q, w, h); q = yv - camAt(nd, p.y, p.x); }
+    ivec2 pq = nearestB(q, w, h);
+    vec2 rr = abs(q + camAt(nd, pq.y, pq.x) - yv);
+    bool inb = q.x >= 0.0 && q.x <= float(w) - 1.0 && q.y >= 0.0 && q.y <= float(h) - 1.0;
+    bool good = max(rr.x, rr.y) <= 1.0 && inb;
+    bool oob = q.x < -0.5 || q.x > float(w) - 0.5 || q.y < -0.5 || q.y > float(h) - 0.5;
+    vec2 q0 = floor(q), wq = q - q0;
+    vec2 fx = vec2(0.0);
+    for (int j = 0; j < 4; ++j) {
+        int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+        bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);                                   
+        float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+        px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+        fx += wt * camAt(nd, py, px);
+    }
+    r[0] = 0.0; r[1] = 0.0; r[2] = -fx.x; r[3] = -fx.y; r[4] = good ? 0.0 : 1.0; r[5] = oob ? 1.0 : 0.0;
+}
+
+                                                                                                         
+                                      
+void candAt(Seg pf, Seg inv, int X, int Y, out float c[12]) {
+    uint w = pf.t.w, h = pf.t.h;
+    for (uint i = 0u; i < 4u; ++i) {
+        uint f0 = (i < 2u ? 0u : 6u) + (i & 1u) * 2u, s0 = (i & 1u) * 3u;
+        float fxv = segRead(inv, 0u, Y, X, f0), fyv = segRead(inv, 0u, Y, X, f0 + 1u);
+        bool off = offFrameAt(X, Y, fxv, fyv, w, h);
+        for (uint k = 0u; k < 3u; ++k)
+            c[3u * i + k] = off ? float(hashn(uint(X), uint(Y), k, i)) / 4294967296.0
+                                : segBilinearZ(pf, 0u, float(X) + fxv, float(Y) + fyv, s0 + k);
+    }
+}
+
+void main() {
+    uint kind = opw(OP_KIND);
+#ifdef MLOF2_GEN_RED
+#ifndef MLOF2_DX
+                                                                           
+                                            
+    if (MLOF2_RED_KIND >= 0) kind = uint(MLOF2_RED_KIND);
+#endif
+#endif
+    to = outAt();
+    out_coff = opw(OP_OUT_COFF);
+    uint out_c = opw(OP_OUT_C);
+    uint gid = gl_GlobalInvocationID.x, lid = gl_LocalInvocationID.x;
+
+#ifdef MLOF2_GEN_RED
+    if (IS(K_VIG_PART)) {                                                                                          
+        if (fcf(FC_PAIR_FIRST) == 0.0) return;
+        Seg ca = segAt(0u), cb = segAt(1u), mv = segAt(2u), mvv = segAt(3u);
+        uint gw = (ca.t.w + 3u) / 4u, gh = (ca.t.h + 3u) / 4u;
+        float v[13];
+        for (int i = 0; i < 13; ++i) v[i] = 0.0;
+        if (gid < gw * gh) {
+            const bool lane = mv.t.w != ca.t.w;                                                                          
+            int gx_ = int(gid % gw), gy_ = int(gid / gw);
+            int X = gx_ * 4 + (lane ? 1 : 0), Y = gy_ * 4 + (lane ? 1 : 0);
+            int MX = lane ? 2 * gx_ : X, MY = lane ? 2 * gy_ : Y;
+            float W = float(ca.t.w), H = float(ca.t.h);
+            float mx, my, vv;
+#ifndef MLOF2_DX
+            if (extIn()) { vec2 em = extMvAt(X, Y); mx = em.x; my = em.y; vv = 1.0; } else
+#endif
+            { mx = segRead(mv, 0u, MY, MX, 0u); my = segRead(mv, 0u, MY, MX, 1u); vv = segRead(mvv, 0u, MY, MX, 0u); }
+            float sx = float(X) + mx, sy = float(Y) + my;
+            bool ok = vv > 0.5 && sx >= 1.0 && sx <= W - 2.0 && sy >= 1.0 && sy <= H - 2.0 &&
+                      length(vec2(mx, my)) > 30.0;
+            if (ok) {
+                float la, lb;
+#ifndef MLOF2_DX
+                if (extIn()) {
+                    vec3 ba = extColABil(sx, sy, ca.t.w, ca.t.h), cbv = extCol(true, X, Y);
+                    la = 0.299 * ba.x + 0.587 * ba.y + 0.114 * ba.z;
+                    lb = 0.299 * cbv.x + 0.587 * cbv.y + 0.114 * cbv.z;
+                } else
+#endif
+                {
+                    la = 0.299 * segBilinearZ(ca, 0u, sx, sy, 0u) + 0.587 * segBilinearZ(ca, 0u, sx, sy, 1u) + 0.114 * segBilinearZ(ca, 0u, sx, sy, 2u);
+                    lb = lum3(cb, Y, X);
+                }
+                float r = log(max(lb, 1e-6)) - log(max(la, 1e-6));
+                ok = la > 0.03 && lb > 0.03 && abs(r) < 0.5;
+                if (ok) {
+                    float a0, a1, a2, b0, b1, b2;
+                    vfeat(float(X), float(Y), W, H, a0, a1, a2); vfeat(sx, sy, W, H, b0, b1, b2);
+                    float R[3] = float[3](a0 - b0, a1 - b1, a2 - b2);
+                    for (int i = 0; i < 3; ++i) { for (int j = 0; j < 3; ++j) v[i * 3 + j] = R[i] * R[j]; v[9 + i] = R[i] * r; }
+                    v[12] = 1.0;
+                }
+            }
+        }
+        for (int i = 0; i < 13; ++i) sh_red[lid * 13u + uint(i)] = v[i];
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lid < s) for (uint i = 0u; i < 13u; ++i) sh_red[lid * 13u + i] += sh_red[(lid + s) * 13u + i];
+            barrier();
+        }
+        if (lid == 0u) for (uint i = 0u; i < 13u; ++i) tensorWrite(to, 0u, 0, int(gl_WorkGroupID.x), i, sh_red[i]);
+        return;
+    }
+    if (IS(K_VIG_SOLVE)) {
+        if (fcf(FC_PAIR_FIRST) == 0.0) return;
+        Seg vp = segAt(0u);
+        uint ng = (vp.t.w * vp.t.h + 63u) / 64u;
+
+        float s_loc[13];
+        for (int i = 0; i < 13; ++i) s_loc[i] = 0.0;
+
+        uint step_w = vp.t.c_alloc * 2u;
+        for (uint g = lid; g < ng; g += 64u) {
+            uint u = (vp.t.base + g * step_w) >> 2u;
+            vec2 v0 = unpackHalf2x16(arena_u32[u]);
+            vec2 v1 = unpackHalf2x16(arena_u32[u + 1u]);
+            vec2 v2 = unpackHalf2x16(arena_u32[u + 2u]);
+            vec2 v3 = unpackHalf2x16(arena_u32[u + 3u]);
+            vec2 v4 = unpackHalf2x16(arena_u32[u + 4u]);
+            vec2 v5 = unpackHalf2x16(arena_u32[u + 5u]);
+            float v6 = unpackHalf2x16(arena_u32[u + 6u]).x;
+            s_loc[0] += v0.x; s_loc[1] += v0.y;
+            s_loc[2] += v1.x; s_loc[3] += v1.y;
+            s_loc[4] += v2.x; s_loc[5] += v2.y;
+            s_loc[6] += v3.x; s_loc[7] += v3.y;
+            s_loc[8] += v4.x; s_loc[9] += v4.y;
+            s_loc[10] += v5.x; s_loc[11] += v5.y;
+            s_loc[12] += v6;
+        }
+
+        for (int i = 0; i < 13; ++i) sh_red[lid * 13u + uint(i)] = s_loc[i];
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lid < s) {
+                for (uint i = 0u; i < 13u; ++i) sh_red[lid * 13u + i] += sh_red[(lid + s) * 13u + i];
+            }
+            barrier();
+        }
+        if (lid != 0u) return;
+
+        float s[13];
+        for (int i = 0; i < 13; ++i) s[i] = sh_red[i];
+                                                                        
+        float A[9], b[3];
+        for (uint i = 0u; i < 9u; ++i) A[i] = 0.85 * tensorRead(to, 0u, 0, 0, i);
+        for (uint i = 0u; i < 3u; ++i) b[i] = 0.85 * tensorRead(to, 0u, 0, 0, 9u + i);
+        if (s[12] > 64.0) {
+            float w = 1e4 / s[12];
+            for (int i = 0; i < 9; ++i) A[i] += w * s[i];
+            for (int i = 0; i < 3; ++i) b[i] += w * s[9 + i];
+        }
+        for (uint i = 0u; i < 9u; ++i) tensorWrite(to, 0u, 0, 0, i, A[i]);
+        for (uint i = 0u; i < 3u; ++i) tensorWrite(to, 0u, 0, 0, 9u + i, b[i]);
+        float rr = max(1e-6 * (A[0] + A[4] + A[8]) / 3.0, 1e-9);
+        bool fr[3] = bool[3](true, true, true);
+        float lv[3] = float[3](0.0, 0.0, 0.0);
+        for (int it = 0; it < 3; ++it) {
+                                                                                        
+            float M[9], y[3]; int id[3]; int n = 0;
+            for (int i = 0; i < 3; ++i) if (fr[i]) id[n++] = i;
+            for (int i = 0; i < n; ++i) { y[i] = b[id[i]]; for (int j = 0; j < n; ++j) M[i * 3 + j] = A[id[i] * 3 + id[j]] + (i == j ? rr : 0.0); }
+            for (int c = 0; c < n; ++c) {
+                int p = c; for (int r2 = c + 1; r2 < n; ++r2) if (abs(M[r2 * 3 + c]) > abs(M[p * 3 + c])) p = r2;
+                if (p != c) { for (int j = 0; j < n; ++j) { float tmp = M[c * 3 + j]; M[c * 3 + j] = M[p * 3 + j]; M[p * 3 + j] = tmp; } float ty = y[c]; y[c] = y[p]; y[p] = ty; }
+                for (int r2 = c + 1; r2 < n; ++r2) { float f = M[r2 * 3 + c] / M[c * 3 + c]; for (int j = c; j < n; ++j) M[r2 * 3 + j] -= f * M[c * 3 + j]; y[r2] -= f * y[c]; }
+            }
+            float xs[3];
+            for (int c = n - 1; c >= 0; --c) { float a = y[c]; for (int j = c + 1; j < n; ++j) a -= M[c * 3 + j] * xs[j]; xs[c] = a / M[c * 3 + c]; }
+            for (int i = 0; i < 3; ++i) lv[i] = 0.0;
+            bool any = false;
+            for (int i = 0; i < n; ++i) { lv[id[i]] = xs[i]; if (xs[i] > 0.0) any = true; }
+            if (!any) break;
+            for (int i = 0; i < 3; ++i) if (fr[i] && lv[i] > 0.0) fr[i] = false;
+        }
+        for (uint i = 0u; i < 3u; ++i) tensorWrite(to, 0u, 0, 0, 12u + i, lv[i]);
+        return;
+    }
+    if (IS(K_RESIZE_AREA)) {                                                                                        
+        Seg sa = segAt(0u);                                                                                      
+        int f = int(to.s / sa.t.s);
+        uint orow = gl_WorkGroupID.x / (to.w * to.h), orem = gl_WorkGroupID.x - orow * to.w * to.h;
+        int oyy = int(orem / to.w), oxx = int(orem - (orem / to.w) * to.w);
+        vec4 a4 = vec4(0.0);
+        for (int r = int(lid); r < f; r += 64)
+            for (int x = 0; x < f; ++x)
+                for (uint c = 0u; c < out_c; ++c) a4[c] += segRead(sa, orow, oyy * f + r, oxx * f + x, c);
+        for (uint c = 0u; c < 4u; ++c) sh_red[lid * 13u + c] = a4[c];
+        barrier();
+        for (uint st = 32u; st > 0u; st >>= 1) {
+            if (lid < st) for (uint c = 0u; c < 4u; ++c) sh_red[lid * 13u + c] += sh_red[(lid + st) * 13u + c];
+            barrier();
+        }
+        if (lid == 0u) {
+            for (uint c = 0u; c < out_c; ++c) wput(to, orow, oyy, oxx, out_coff + c, sh_red[c] / float(f * f));
+            if (out_coff + out_c == to.c) wzeroPad(to, orow, oyy, oxx);
+            wflush();
+        }
+        return;
+    }
+    if (IS(K_MEDIAN_HIST)) {                                                                                                  
+                                                                               
+        Seg a = segAt(0u);
+        uint N = a.t.w * a.t.h, hb = to.base >> 2u;                                                                    
+        for (uint i = lid; i < 4096u; i += 64u) sh_hist[i] = 0u;
+        barrier();
+        uint p0 = gl_WorkGroupID.x * 2048u;
+        for (uint i = p0 + lid; i < min(p0 + 2048u, N); i += 64u) {
+            float v = clamp(segRead(a, 0u, int(i / a.t.w), int(i % a.t.w), 0u), 0.0, 1.0);
+            atomicAdd(sh_hist[min(uint(v * 4096.0), 4095u)], 1u);
+        }
+        barrier();
+        for (uint i = lid; i < 4096u; i += 64u) if (sh_hist[i] != 0u) atomicAdd(arena_u32[hb + i], sh_hist[i]);
+        return;
+    }
+    if (IS(K_MEDIAN_PICK)) {                                                                             
+        if (gl_WorkGroupID.x != 0u) return;
+        Seg hs = segAt(0u), a = segAt(1u);
+        uint N = a.t.w * a.t.h, hb = hs.t.base >> 2u;
+        uint part = 0u;
+        for (uint i = 0u; i < 64u; ++i) part += arena_u32[hb + lid * 64u + i];
+        sh_hist[lid] = part;
+        barrier();
+        if (lid == 0u) {
+            uint k = (N - 1u) / 2u, cum = 0u, bsel = 4095u;
+            for (uint g = 0u; g < 64u; ++g) {
+                if (cum + sh_hist[g] >= k + 1u) {
+                    for (uint i = 0u; i < 64u; ++i) { cum += arena_u32[hb + g * 64u + i]; if (cum >= k + 1u) { bsel = g * 64u + i; break; } }
+                    break;
+                }
+                cum += sh_hist[g];
+            }
+            s_med = (float(bsel) + 0.5) / 4096.0;
+        }
+        barrier();
+        float med = s_med;
+        for (uint i = lid; i < to.w * to.h; i += 64u) tensorWrite(to, 0u, int(i / to.w), int(i % to.w), out_coff, med);
+        return;
+    }
+    if (IS(K_MEDIAN)) {                                                                               
+        if (gl_WorkGroupID.x != 0u) return;
+        Seg a = segAt(0u);
+        uint N = a.t.w * a.t.h;
+        for (uint i = lid; i < 4096u; i += 64u) sh_hist[i] = 0u;
+        barrier();
+        for (uint i = lid; i < N; i += 64u) {                                                                       
+            float v = clamp(segRead(a, 0u, int(i / a.t.w), int(i % a.t.w), 0u), 0.0, 1.0);
+            atomicAdd(sh_hist[min(uint(v * 4096.0), 4095u)], 1u);
+        }
+        barrier();
+        if (lid == 0u) {
+            uint k = (N - 1u) / 2u, cum = 0u, bsel = 4095u;
+            for (uint i = 0u; i < 4096u; ++i) { cum += sh_hist[i]; if (cum >= k + 1u) { bsel = i; break; } }
+            s_med = (float(bsel) + 0.5) / 4096.0;
+        }
+        barrier();
+        float med = s_med;
+        uint total_out = to.w * to.h;
+        for (uint i = lid; i < total_out; i += 64u) tensorWrite(to, 0u, int(i / to.w), int(i % to.w), out_coff, med);
+        return;
+    }
+
+    if (IS(K_HOMOG_ACC)) {
+                                                                                                          
+        Seg qc = segAt(0u);                                                
+        Seg ic = segAt(1u);                                      
+        bool has_h = (opw(OP_NSEG) >= 3u);
+        Seg h_prev;
+        if (has_h) h_prev = segAt(2u);
+
+                              
+        if (lid < 64u) sh_hist[lid] = 0u;
+        for (uint i = 0u; i < 45u; ++i) {
+            sh_hist[64u + lid * 45u + i] = 0u;
+        }
+        barrier();
+
+        uint N = qc.t.w * qc.t.h;
+        if (gid < N) {
+            int ox_q = int(gid % qc.t.w);
+            int oy_q = int(gid / qc.t.w);
+
+            float oob_mv = segRead(qc, 0u, oy_q, ox_q, 22u);
+            bool is_band = (oob_mv > 0.5);
+
+            bool is_ring = false;
+            vec2 mv = vec2(0.0), cam = vec2(0.0);
+            if (!is_band) {
+                float hole_mv = segRead(qc, 0u, oy_q, ox_q, 20u);
+                if (hole_mv < 0.5) {
+                    mv = vec2(segRead(qc, 0u, oy_q, ox_q, 12u), segRead(qc, 0u, oy_q, ox_q, 13u)) * 4.0;
+                    if (!offFrame(mv.x, mv.y, qc.t.w * 4u, qc.t.h * 4u)) {
+                        cam = vec2(segRead(ic, 0u, oy_q, ox_q, 0u), segRead(ic, 0u, oy_q, ox_q, 1u)) * 4.0;
+                                                                            
+                        for (int dx = -12; dx <= 12; dx += 3) {
+                            int sx = ox_q + dx;
+                            if (sx >= 0 && sx < int(qc.t.w)) {
+                                if (segRead(qc, 0u, oy_q, sx, 22u) > 0.5) { is_ring = true; break; }
+                            }
+                        }
+                        if (!is_ring) {
+                            for (int dy = -12; dy <= 12; dy += 3) {
+                                int sy = oy_q + dy;
+                                if (sy >= 0 && sy < int(qc.t.h)) {
+                                    if (segRead(qc, 0u, sy, ox_q, 22u) > 0.5) { is_ring = true; break; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (is_ring) {
+                float diff = length(cam - mv);
+                uint b = clamp(uint(diff), 0u, 63u);
+                atomicAdd(sh_hist[b], 1u);
+
+                float W_full = float(qc.t.w * 4u);
+                float H_full = float(qc.t.h * 4u);
+                float X = (float(ox_q * 4) + 2.0 - 0.5 * W_full) / W_full;
+                float Y = (float(oy_q * 4) + 2.0 - 0.5 * H_full) / W_full;
+                float U = X + mv.x / W_full;
+                float V = Y + mv.y / W_full;
+
+                float w = 1.0;
+                if (has_h) {
+                    mat3 H_mat;
+                    H_mat[0][0] = segRead(h_prev, 0u, 0, 0, 0u);
+                    H_mat[0][1] = segRead(h_prev, 0u, 0, 0, 1u);
+                    H_mat[0][2] = segRead(h_prev, 0u, 0, 0, 2u);
+                    H_mat[1][0] = segRead(h_prev, 0u, 0, 0, 3u);
+                    H_mat[1][1] = segRead(h_prev, 0u, 0, 0, 4u);
+                    H_mat[1][2] = segRead(h_prev, 0u, 0, 0, 5u);
+                    H_mat[2][0] = segRead(h_prev, 0u, 0, 0, 6u);
+                    H_mat[2][1] = segRead(h_prev, 0u, 0, 0, 7u);
+                    H_mat[2][2] = 1.0;
+
+                    vec3 Q = H_mat * vec3(X, Y, 1.0);
+                    vec2 pred_UV = Q.xy / max(abs(Q.z), 1e-7);
+                    float res_px = length(pred_UV - vec2(U, V)) * W_full;
+                    w = (res_px < 3.0) ? 1.0 : (1.7320508075688772 * inversesqrt(res_px));
+                }
+
+                float r1[8] = float[8](X, Y, 1.0, 0.0, 0.0, 0.0, -U * X, -U * Y);
+                float r2[8] = float[8](0.0, 0.0, 0.0, X, Y, 1.0, -V * X, -V * Y);
+
+                int idx = 0;
+                for (int i = 0; i < 8; ++i) {
+                    for (int j = i; j < 8; ++j) {
+                        float term = w * (r1[i] * r1[j] + r2[i] * r2[j]);
+                        sh_hist[64u + lid * 45u + uint(idx++)] = floatBitsToUint(term);
+                    }
+                }
+                for (int i = 0; i < 8; ++i) {
+                    float term = w * (r1[i] * U + r2[i] * V);
+                    sh_hist[64u + lid * 45u + 36u + uint(i)] = floatBitsToUint(term);
+                }
+                sh_hist[64u + lid * 45u + 44u] = floatBitsToUint(1.0);
+            }
+        }
+        barrier();
+
+                                      
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lid < s) {
+                uint base_dst = 64u + lid * 45u;
+                uint base_src = 64u + (lid + s) * 45u;
+                for (uint i = 0u; i < 45u; ++i) {
+                    float va = uintBitsToFloat(sh_hist[base_dst + i]);
+                    float vb = uintBitsToFloat(sh_hist[base_src + i]);
+                    sh_hist[base_dst + i] = floatBitsToUint(va + vb);
+                }
+            }
+            barrier();
+        }
+
+                                                                                   
+        uint wg_idx = gl_WorkGroupID.x;
+        uint base_u32 = (to.base >> 2u) + wg_idx * to.c_alloc;
+        if (lid < 45u) {
+            arena_u32[base_u32 + lid] = sh_hist[64u + lid];
+        }
+        if (lid < 64u) {
+            arena_u32[base_u32 + 45u + lid] = floatBitsToUint(float(sh_hist[lid]));
+        }
+        return;
+    }
+
+    if (IS(K_HOMOG_SOLVE)) {
+        if (gl_WorkGroupID.x != 0u) return;
+        Seg vp = segAt(0u);                                
+        uint ng = vp.t.w * vp.t.h;
+        uint vp_base_u32 = (vp.t.base >> 2u) + vp.c_off;
+
+        float s_loc[45];
+        for (int i = 0; i < 45; ++i) s_loc[i] = 0.0;
+        uint h_loc[64];
+        for (int i = 0; i < 64; ++i) h_loc[i] = 0u;
+
+        for (uint g = lid; g < ng; g += 64u) {
+            uint g_base = vp_base_u32 + g * vp.t.c_alloc;
+            float pts = uintBitsToFloat(arena_u32[g_base + 44u]);
+            if (pts == 0.0) continue;                              
+            for (uint i = 0u; i < 44u; ++i) {
+                s_loc[i] += uintBitsToFloat(arena_u32[g_base + i]);
+            }
+            s_loc[44] += pts;
+            for (uint i = 0u; i < 64u; ++i) {
+                h_loc[i] += uint(uintBitsToFloat(arena_u32[g_base + 45u + i]));
+            }
+        }
+
+                                      
+        for (uint i = 0u; i < 45u; ++i) {
+            sh_hist[lid * 45u + i] = floatBitsToUint(s_loc[i]);
+        }
+        barrier();
+
+        for (uint s = 32u; s > 0u; s >>= 1) {
+            if (lid < s) {
+                uint base_dst = lid * 45u;
+                uint base_src = (lid + s) * 45u;
+                for (uint i = 0u; i < 45u; ++i) {
+                    float va = uintBitsToFloat(sh_hist[base_dst + i]);
+                    float vb = uintBitsToFloat(sh_hist[base_src + i]);
+                    sh_hist[base_dst + i] = floatBitsToUint(va + vb);
+                }
+            }
+            barrier();
+        }
+
+        float tot_s[45];
+        if (lid == 0u) {
+            for (uint i = 0u; i < 45u; ++i) {
+                tot_s[i] = uintBitsToFloat(sh_hist[i]);
+            }
+        }
+        barrier();
+
+                                               
+        for (uint i = 0u; i < 64u; ++i) {
+            sh_hist[lid * 64u + i] = h_loc[i];
+        }
+        barrier();
+
+        if (lid < 64u) {
+            uint tot = 0u;
+            for (uint t = 0u; t < 64u; ++t) {
+                tot += sh_hist[t * 64u + lid];
+            }
+            sh_hist[lid] = tot;
+        }
+        barrier();
+
+        if (lid != 0u) return;
+
+        float n_pts = tot_s[44];
+
+        uint half_pts = uint(n_pts * 0.5);
+        uint cum = 0u;
+        float median_diff = 0.0;
+        for (uint b = 0u; b < 64u; ++b) {
+            cum += sh_hist[b];
+            if (cum >= half_pts && half_pts > 0u) {
+                median_diff = float(b) + 0.5;
+                break;
+            }
+        }
+
+        float trail_auto = fcf(FC_TRAIL_HOMOG_AUTO);
+        if (trail_auto <= 0.0) trail_auto = 10.0;
+        bool force_homog = (fcf(FC_FORCE_HOMOG) > 0.5);
+        bool use_homog = (n_pts >= 32.0) && (force_homog || (median_diff > trail_auto));
+
+        float M[8][9];
+        int idx = 0;
+        for (int i = 0; i < 8; ++i) {
+            for (int j = i; j < 8; ++j) {
+                float v = tot_s[idx++];
+                M[i][j] = v;
+                M[j][i] = v;
+            }
+        }
+        for (int i = 0; i < 8; ++i) {
+            M[i][8] = tot_s[36 + i];
+        }
+
+                               
+        for (int i = 0; i < 8; ++i) M[i][i] += 1e-4;
+
+                                   
+        bool singular = false;
+        for (int i = 0; i < 8; ++i) {
+            int p = i;
+            float max_v = abs(M[i][i]);
+            for (int r = i + 1; r < 8; ++r) {
+                if (abs(M[r][i]) > max_v) {
+                    max_v = abs(M[r][i]);
+                    p = r;
+                }
+            }
+            if (max_v < 1e-9) { singular = true; break; }
+            if (p != i) {
+                for (int c = i; c < 9; ++c) {
+                    float tmp = M[i][c]; M[i][c] = M[p][c]; M[p][c] = tmp;
+                }
+            }
+            float diag = M[i][i];
+            for (int c = i; c < 9; ++c) M[i][c] /= diag;
+            for (int r = 0; r < 8; ++r) {
+                if (r != i) {
+                    float factor = M[r][i];
+                    for (int c = i; c < 9; ++c) M[r][c] -= factor * M[i][c];
+                }
+            }
+        }
+
+        if (singular) use_homog = false;
+
+        float h_sol[8];
+        for (int i = 0; i < 8; ++i) {
+            h_sol[i] = singular ? 0.0 : M[i][8];
+        }
+
+        for (uint i = 0u; i < 8u; ++i) tensorWrite(to, 0u, 0, 0, i, h_sol[i]);
+        tensorWrite(to, 0u, 0, 0, 8u, 1.0);
+        tensorWrite(to, 0u, 0, 0, 9u, use_homog ? 1.0 : 0.0);
+        tensorWrite(to, 0u, 0, 0, 10u, median_diff);
+        tensorWrite(to, 0u, 0, 0, 11u, n_pts);
+        for (uint i = 12u; i < 16u; ++i) tensorWrite(to, 0u, 0, 0, i, 0.0);
+        return;
+    }
+
+    return;
+#else
+    if (IS(K_FEAT4C)) {                                                                                
+        Seg pf = segAt(0u), inv = segAt(1u), da = segAt(2u), db = segAt(3u), co = segAt(4u);
+        uint blk = gid >> 4u, sb_ = gid & 15u, w = pf.t.w, h = pf.t.h;
+        bool okb = blk < to.w * to.h;
+        ox = int(blk % to.w); oy = int(blk / to.w);
+        int X = ox * 4 + int(sb_ & 3u), Y = oy * 4 + int(sb_ >> 2u);
+        float f[28];
+        for (int i = 0; i < 28; ++i) f[i] = 0.0;
+        if (okb) {
+            float c12[12];
+            candAt(pf, inv, X, Y, c12);
+            for (uint c = 0u; c < 12u; ++c) f[c] = c12[c];
+            vec4 m4 = segRead4(inv, 0u, Y, X, 0u), o4 = segRead4(inv, 0u, Y, X, 6u);
+            vec2 ma = m4.xy, mb = m4.zw, oa = o4.xy, ob = o4.zw;
+            float x12 = segBilinearZ(da, 0u, float(X) + ma.x, float(Y) + ma.y, 0u);
+            float x13 = segBilinearZ(db, 0u, float(X) + mb.x, float(Y) + mb.y, 0u);
+            f[12] = x12; f[13] = x13;
+            f[14] = segRead(inv, 0u, Y, X, 4u); f[15] = segRead(inv, 0u, Y, X, 10u); f[16] = fcf(FC_T);
+            f[17] = (abs(c12[0] - c12[3]) + abs(c12[1] - c12[4]) + abs(c12[2] - c12[5])) * (4.0 / 3.0);
+            f[18] = (abs(c12[6] - c12[9]) + abs(c12[7] - c12[10]) + abs(c12[8] - c12[11])) * (4.0 / 3.0);
+            f[19] = min(length(ma - oa) / 16.0, 4.0);
+            vec2 q = vec2(float(X), float(Y)) + ob, q0 = floor(q), wq = q - q0;
+            vec2 cw = vec2(0.0);
+            for (int j = 0; j < 4; ++j) {
+                int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+                bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);
+                float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+                px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+                cw += wt * vec2(bilUp(co, px, py, w, h, 0u), bilUp(co, px, py, w, h, 1u));
+            }
+            vec2 _scw = vec2(1.0) / (vec2(1.0) + exp(-cw)); f[20] = _scw.x; f[21] = _scw.y;
+            f[22] = min(abs(x12 - x13) * 16.0, 4.0);
+            f[23] = min(abs(segBilinearZ(da, 0u, float(X) + oa.x, float(Y) + oa.y, 0u) -
+                            segBilinearZ(db, 0u, float(X) + ob.x, float(Y) + ob.y, 0u)) * 16.0, 4.0);
+            f[24] = offFrameAt(X, Y, ma.x, ma.y, w, h) ? 1.0 : 0.0;
+            f[25] = segRead(inv, 0u, Y, X, 5u);
+            f[26] = offFrameAt(X, Y, oa.x, oa.y, w, h) ? 1.0 : 0.0;
+            f[27] = segRead(inv, 0u, Y, X, 11u);
+        }
+        for (int i = 0; i < 28; ++i)
+#ifdef MLOF2_DX
+            for (uint m = 8u; m > 0u; m >>= 1) f[i] += subgroupShuffleXor(f[i], m);
+#else
+            f[i] = subgroupClusteredAdd(f[i], 16u);
+#endif
+        if (sb_ == 0u && okb) {
+            for (uint c = 0u; c < 28u; ++c) put(c, f[c] * (1.0 / 16.0));
+            if (out_coff + out_c == to.c) wzeroPad(to, 0u, oy, ox);
+            wflush();
+        }
+        return;
+    }
+    if (IS(K_FEAT4)) {                                                                                                
+        Seg cd = segAt(0u), da = segAt(1u), db = segAt(2u), im = segAt(3u), io = segAt(4u), co = segAt(5u);                  
+        uint blk = gid >> 4u, sub = gid & 15u, w = cd.t.w, h = cd.t.h;                                                 
+        bool okb = blk < to.w * to.h;
+        ox = int(blk % to.w); oy = int(blk / to.w);
+        int X = ox * 4 + int(sub & 3u), Y = oy * 4 + int(sub >> 2u);
+        float f[28];
+        for (int i = 0; i < 28; ++i) f[i] = 0.0;
+        if (okb) {
+            vec4 c0 = segRead4(cd, 0u, Y, X, 0u), c1 = segRead4(cd, 0u, Y, X, 4u), c2 = segRead4(cd, 0u, Y, X, 8u);
+            float c12[12] = float[12](c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w, c2.x, c2.y, c2.z, c2.w);
+            for (uint c = 0u; c < 12u; ++c) f[c] = c12[c];
+            vec4 m4 = segRead4(im, 0u, Y, X, 0u), o4 = segRead4(io, 0u, Y, X, 0u);
+            vec2 ma = m4.xy, mb = m4.zw, oa = o4.xy, ob = o4.zw;
+            float x12 = segBilinearZ(da, 0u, float(X) + ma.x, float(Y) + ma.y, 0u);
+            float x13 = segBilinearZ(db, 0u, float(X) + mb.x, float(Y) + mb.y, 0u);
+            f[12] = x12; f[13] = x13;
+            f[14] = segRead(im, 0u, Y, X, 4u); f[15] = segRead(io, 0u, Y, X, 4u); f[16] = fcf(FC_T);
+            f[17] = (abs(c12[0] - c12[3]) + abs(c12[1] - c12[4]) + abs(c12[2] - c12[5])) * (4.0 / 3.0);
+            f[18] = (abs(c12[6] - c12[9]) + abs(c12[7] - c12[10]) + abs(c12[8] - c12[11])) * (4.0 / 3.0);
+            f[19] = min(length(ma - oa) / 16.0, 4.0);
+            vec2 q = vec2(float(X), float(Y)) + ob, q0 = floor(q), wq = q - q0;
+            vec2 cw = vec2(0.0);
+            for (int j = 0; j < 4; ++j) {
+                int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+                bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);
+                float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+                px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+                cw += wt * vec2(bilUp(co, px, py, w, h, 0u), bilUp(co, px, py, w, h, 1u));
+            }
+            vec2 _scw = vec2(1.0) / (vec2(1.0) + exp(-cw)); f[20] = _scw.x; f[21] = _scw.y;
+            f[22] = min(abs(x12 - x13) * 16.0, 4.0);
+            f[23] = min(abs(segBilinearZ(da, 0u, float(X) + oa.x, float(Y) + oa.y, 0u) -
+                            segBilinearZ(db, 0u, float(X) + ob.x, float(Y) + ob.y, 0u)) * 16.0, 4.0);
+            f[24] = offFrameAt(X, Y, ma.x, ma.y, w, h) ? 1.0 : 0.0;
+            f[25] = segRead(im, 0u, Y, X, 5u);
+            f[26] = offFrameAt(X, Y, oa.x, oa.y, w, h) ? 1.0 : 0.0;
+            f[27] = segRead(io, 0u, Y, X, 5u);
+        }
+        for (int i = 0; i < 28; ++i)                                                         
+#ifdef MLOF2_DX
+            for (uint m = 8u; m > 0u; m >>= 1) f[i] += subgroupShuffleXor(f[i], m);                               
+#else
+            f[i] = subgroupClusteredAdd(f[i], 16u);
+#endif
+        if (sub == 0u && okb) {
+            for (uint c = 0u; c < 28u; ++c) put(c, f[c] * (1.0 / 16.0));
+            if (out_coff + out_c == to.c) wzeroPad(to, 0u, oy, ox);
+            wflush();
+        }
+        return;
+    }
+    if (IS(K_Q_PREP)) {                                                                                            
+        Seg cab = segAt(0u), da = segAt(1u), db = segAt(2u), map = segAt(3u);                                        
+        uint blk = gid >> 4u, sub_ = gid & 15u;
+        bool okb = blk < to.w * to.h;
+        ox = int(blk % to.w); oy = int(blk / to.w);
+        int X = ox * 4 + int(sub_ & 3u), Y = oy * 4 + int(sub_ >> 2u);
+        float f[12];
+        for (int i = 0; i < 12; ++i) f[i] = 0.0;
+        if (okb) {
+#ifndef MLOF2_DX
+            vec4 a0 = texelFetch(uTexCabA, ivec2(X, Y), 0);
+            vec4 a1 = texelFetch(uTexCabB, ivec2(X, Y), 0);
+#else
+            vec4 a0 = segRead4(cab, 0u, Y, X, 0u), a1 = segRead4(cab, 0u, Y, X, 4u);
+#endif
+            f[0] = a0.x; f[1] = a0.y; f[2] = a0.z; f[3] = a0.w; f[4] = a1.x; f[5] = a1.y; f[6] = a1.z; f[7] = a1.w;
+            const bool lane = da.t.w == to.w;                                                                                      
+            if (opi(0) != 0 || lane) {                                                                                                 
+                int PX = ox * 4 + (lane ? 1 : 2), PY = oy * 4 + (lane ? 1 : 2);
+                float k = sub_ == 0u ? 16.0 : 0.0;
+                float dav = 0.0, dbv = 0.0;
+#ifndef MLOF2_DX
+                if (extIn()) { if (sub_ == 0u) { dav = extDepFeat(false, PX, PY); dbv = extDepFeat(true, PX, PY); } } else
+#endif
+                { dav = lane ? segRead(da, 0u, oy, ox, 0u) : segRead(da, 0u, PY, PX, 0u); dbv = lane ? segRead(db, 0u, oy, ox, 0u) : segRead(db, 0u, PY, PX, 0u); }
+                f[8] = k * dav;
+                f[9] = k * dbv;
+                vec2 mp_k = fcf(FC_EXT_MVAP) > 0.5 ? extMvPrevAt(PX, PY) : segRead2(map, 0u, PY, PX, 0u);
+                f[10] = k * (0.25 * mp_k.x); f[11] = k * (0.25 * mp_k.y);
+            } else {
+                f[8] = segRead(da, 0u, Y, X, 0u); f[9] = segRead(db, 0u, Y, X, 0u);
+                vec2 mp_y = segRead2(map, 0u, Y, X, 0u); f[10] = 0.25 * mp_y.x; f[11] = 0.25 * mp_y.y;
+            }
+        }
+        for (int i = 0; i < 12; ++i)                                                         
+#ifdef MLOF2_DX
+            for (uint m = 8u; m > 0u; m >>= 1) f[i] += subgroupShuffleXor(f[i], m);
+#else
+            f[i] = subgroupClusteredAdd(f[i], 16u);
+#endif
+        if (sub_ == 0u && okb) {
+            const float inv16 = 1.0 / 16.0;
+#ifndef MLOF2_DX
+            imageStore(uImgQpA, ivec2(ox, oy), vec4(f[0], f[1], f[2], f[3]) * inv16);
+            imageStore(uImgQpB, ivec2(ox, oy), vec4(f[4], f[5], f[6], f[7]) * inv16);
+#endif
+            if (to.fmt == 1u && to.c_alloc == 12u) {
+                uint w_base = (to.base >> 2u) + (uint(oy) * to.w + uint(ox)) * 6u;
+                arena_u32[w_base + 0u] = packHalf2x16(vec2(f[0], f[1]) * inv16);
+                arena_u32[w_base + 1u] = packHalf2x16(vec2(f[2], f[3]) * inv16);
+                arena_u32[w_base + 2u] = packHalf2x16(vec2(f[4], f[5]) * inv16);
+                arena_u32[w_base + 3u] = packHalf2x16(vec2(f[6], f[7]) * inv16);
+                arena_u32[w_base + 4u] = packHalf2x16(vec2(f[8], f[9]) * inv16);
+                arena_u32[w_base + 5u] = packHalf2x16(vec2(f[10], f[11]) * inv16);
+            } else {
+                for (uint c = 0u; c < 12u; ++c) put(c, f[c] * (1.0 / 16.0));
+                if (out_coff + out_c == to.c) wzeroPad(to, 0u, oy, ox);
+                wflush();
+            }
+        }
+        return;
+    }
+    if (IS(K_POOL)) {                                                                                             
+        Seg a = segAt(0u);                                                                                         
+        int k = opi(1), r = k / 2, mode = opi(0);                                                                     
+        uint nyb = (to.h + 7u) / 8u;
+        if (gid >= to.w * nyb) return;
+        ox = int(gid % to.w);
+        int y0 = int(gid / to.w) * 8;
+        for (uint c = 0u; c < out_c; ++c) {
+            float rv[24];                                                                     
+            for (int i = 0; i < 8 + 2 * r; ++i) {
+                int yy = y0 - r + i;
+                float acc = mode == 0 ? 0.0 : -1e30;
+                if (yy >= 0 && yy < int(a.t.h))
+                    for (int dx = -r; dx <= r; ++dx) {                                                  
+                        int xx = ox + dx;
+                        bool in_ = xx >= 0 && xx < int(a.t.w);
+                        float v = segRead(a, 0u, yy, clamp(xx, 0, int(a.t.w) - 1), c);
+                        acc = mode == 0 ? acc + (in_ ? v : 0.0) : max(acc, in_ ? v : -1e30);
+                    }
+                rv[i] = acc;
+            }
+            for (int j = 0; j < 8; ++j) {
+                if (y0 + j >= int(to.h)) break;
+                float acc = mode == 0 ? 0.0 : -1e30;
+                for (int i = 0; i < k; ++i) acc = mode == 0 ? acc + rv[j + i] : max(acc, rv[j + i]);
+                oy = y0 + j;
+                wput(to, 0u, oy, ox, out_coff + c, mode == 0 ? acc / float(k * k) : acc);
+                wflush();
+            }
+        }
+        if (out_coff + out_c == to.c) for (int j = 0; j < 8 && y0 + j < int(to.h); ++j) { oy = y0 + j; wzeroPad(to, 0u, oy, ox); wflush(); }
+        return;
+    }
+    ohw = to.h * to.w;
+    if (gid >= ohw) return;
+    orem = gid;
+    oy = int(gid / to.w); ox = int(gid % to.w);
+
+    if (IS(K_VIG_APPLY)) {
+        Seg im = segAt(0u), vg = segAt(1u);
+        float V = vigV(vg, float(ox), float(oy), float(to.w), float(to.h));
+        for (uint c = 0u; c < out_c; ++c) {
+            float x = segRead(im, 0u, oy, ox, c);
+            put(c, opi(0) == 0 ? x / V : clamp(x * V, 0.0, 1.0));
+        }
+    } else if (IS(K_MUL)) {
+        Seg a = segAt(0u), b = segAt(1u);
+        float m = segRead(b, 0u, oy, ox, 0u);
+        for (uint c = 0u; c < out_c; ++c) put(c, segRead(a, 0u, oy, ox, c) * m);
+    } else if (IS(K_INVERT_T)) {                                                                              
+        Seg f = segAt(0u), fbp = segAt(opw(OP_NSEG) > 2u ? 2u : 0u);
+        uint nseg = opw(OP_NSEG);
+        g_t = opi(0) == 1 ? 0.0 : fcf(FC_T);
+        g_accel = opi(1) != 0 && nseg > 2u && fcf(FC_HAS_PREV) != 0.0;
+        uint w = f.t.w, h = f.t.h;
+        vec2 yv = vec2(float(ox), float(oy));
+        vec2 q = yv - dispAt(f, fbp, oy, ox);
+        for (int k = 0; k < 4; ++k) { ivec2 p = nearestB(q, w, h); q = yv - dispAt(f, fbp, p.y, p.x); }
+        ivec2 pq = nearestB(q, w, h);
+        vec2 r = abs(q + dispAt(f, fbp, pq.y, pq.x) - yv);
+        bool inb = q.x >= 0.0 && q.x <= float(w) - 1.0 && q.y >= 0.0 && q.y <= float(h) - 1.0;
+        bool val = true;
+        if (nseg > 3u) val = segRead(segAt(3u), 0u, pq.y, pq.x, 0u) > 0.5;
+        bool good = max(r.x, r.y) <= 1.0 && inb && val;
+        bool oob = q.x < -0.5 || q.x > float(w) - 0.5 || q.y < -0.5 || q.y > float(h) - 0.5;
+                                                                                            
+        vec2 q0 = floor(q), wq = q - q0;
+        vec2 fx = vec2(0.0), dx = vec2(0.0);
+        for (int j = 0; j < 4; ++j) {                                                                             
+            int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+            bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);
+            float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+            px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+            fx += wt * vec2(segRead(f, 0u, py, px, 0u), segRead(f, 0u, py, px, 1u));
+            dx += wt * dispAt(f, fbp, py, px);
+        }
+        if (to.fmt == 1u && to.c_alloc == 6u) {
+            uint w_base = (to.base >> 2u) + (uint(oy) * to.w + uint(ox)) * 3u;
+            arena_u32[w_base + 0u] = packHalf2x16(vec2(fx.x - dx.x, fx.y - dx.y));
+            arena_u32[w_base + 1u] = packHalf2x16(vec2(-dx.x, -dx.y));
+            arena_u32[w_base + 2u] = packHalf2x16(vec2(good ? 0.0 : 1.0, oob ? 1.0 : 0.0));
+        } else {
+            put(0u, fx.x - dx.x); put(1u, fx.y - dx.y); put(2u, -dx.x); put(3u, -dx.y);
+            put(4u, good ? 0.0 : 1.0); put(5u, oob ? 1.0 : 0.0);
+        }
+    } else if (IS(K_WARP_NOISE)) {
+        Seg s = segAt(0u), fl = segAt(1u);
+        float fxv = segRead(fl, 0u, oy, ox, 0u), fyv = segRead(fl, 0u, oy, ox, 1u);
+        bool off = offFrame(fxv, fyv, to.w, to.h);
+        for (uint c = 0u; c < out_c; ++c)
+            put(c, off ? float(hashn(uint(ox), uint(oy), c, uint(opi(0)))) / 4294967296.0
+                       : segBilinearZ(s, 0u, float(ox) + fxv, float(oy) + fyv, c));
+    } else if (IS(K_OFF_FRAME)) {
+        Seg fl = segAt(0u);
+        put(0u, offFrame(segRead(fl, 0u, oy, ox, 0u), segRead(fl, 0u, oy, ox, 1u), to.w, to.h) ? 1.0 : 0.0);
+    } else if (IS(K_FLOWDIST)) {
+        Seg a = segAt(0u), b = segAt(1u);
+        vec2 d = vec2(segRead(a, 0u, oy, ox, 0u) - segRead(b, 0u, oy, ox, 0u), segRead(a, 0u, oy, ox, 1u) - segRead(b, 0u, oy, ox, 1u));
+        put(0u, min(length(d) / 16.0, 4.0));
+    } else if (IS(K_SIGMOID)) {
+        Seg a = segAt(0u);
+        for (uint c = 0u; c < out_c; ++c) put(c, 1.0 / (1.0 + exp(-segRead(a, 0u, oy, ox, c))));
+    } else if (IS(K_FILL_T)) {
+        put(0u, fcf(FC_T));
+    } else if (IS(K_UP_NEAREST)) {
+        Seg a = segAt(0u);
+        for (uint c = 0u; c < out_c; ++c) put(c, segRead(a, 0u, oy / 2, ox / 2, c));
+    } else if (IS(K_SOFTMAX_BLEND)) {
+        Seg lg = segAt(0u), cd = segAt(1u);
+        float l[4]; float mx = -1e30;
+        for (uint i = 0u; i < 4u; ++i) { l[i] = segRead(lg, 0u, oy, ox, i); mx = max(mx, l[i]); }
+        float s = 0.0;
+        for (uint i = 0u; i < 4u; ++i) { l[i] = exp(l[i] - mx); s += l[i]; }
+        for (uint c = 0u; c < 3u; ++c) {
+            float a = 0.0;
+            for (uint i = 0u; i < 4u; ++i) a += l[i] / s * segRead(cd, 0u, oy, ox, 3u * i + c);
+            put(c, clamp(a, 0.0, 1.0));
+        }
+        for (uint i = 0u; i < 4u; ++i) put(3u + i, l[i] / s);
+    } else if (IS(K_RULE_PREP)) {                                                                                   
+        Seg cd = segAt(0u), wt = segAt(1u), oa = segAt(2u), ob = segAt(3u);
+        float w0 = segRead(wt, 0u, oy, ox, 0u), w1 = segRead(wt, 0u, oy, ox, 1u);
+        float sw = max(w0 + w1, 1e-6);
+        bool fa = segRead(oa, 0u, oy, ox, 0u) > 0.5, fb = segRead(ob, 0u, oy, ox, 0u) > 0.5;
+        float d01 = 0.0, d23 = 0.0;
+        for (uint c = 0u; c < 3u; ++c) {
+            float c0 = segRead(cd, 0u, oy, ox, c), c1 = segRead(cd, 0u, oy, ox, 3u + c);
+            float mo = (w0 / sw) * c0 + (w1 / sw) * c1;
+            put(c, fa ? c1 : (fb ? c0 : mo));
+            d01 += abs(c0 - c1);
+            d23 += abs(segRead(cd, 0u, oy, ox, 6u + c) - segRead(cd, 0u, oy, ox, 9u + c));
+        }
+        put(3u, d01 / 3.0); put(4u, d23 / 3.0);
+        put(5u, (segRead(oa, 0u, oy, ox, 0u) + segRead(ob, 0u, oy, ox, 0u)) > 0.5 ? 1.0 : 0.0);
+    } else if (IS(K_POOL)) {                                                                                      
+        Seg a = segAt(0u);
+        int k = opi(1), r = k / 2;
+        for (uint c = 0u; c < out_c; ++c) {
+            float acc = opi(0) == 0 ? 0.0 : -1e30;
+            for (int dy = -r; dy <= r; ++dy)
+                for (int dx = -r; dx <= r; ++dx) {
+                    int yy = oy + dy, xx = ox + dx;
+                    if (yy < 0 || xx < 0 || yy >= int(a.t.h) || xx >= int(a.t.w)) continue;
+                    float v = segRead(a, 0u, yy, xx, c);
+                    acc = opi(0) == 0 ? acc + v : max(acc, v);
+                }
+            put(c, opi(0) == 0 ? acc / float(k * k) : acc);
+        }
+    } else if (IS(K_LUMA_GRAD)) {
+        Seg a = segAt(0u);
+        float gx = (ox >= 1 && ox <= int(a.t.w) - 2) ? abs(lum3(a, oy, ox + 1) - lum3(a, oy, ox - 1)) : 0.0;
+        float gy = (oy >= 1 && oy <= int(a.t.h) - 2) ? abs(lum3(a, oy + 1, ox) - lum3(a, oy - 1, ox)) : 0.0;
+        put(0u, gx + gy);
+    } else if (IS(K_MASK_MUL)) {
+        Seg a = segAt(0u), b = segAt(1u);
+        put(0u, segRead(a, 0u, oy, ox, 0u) * (1.0 - segRead(b, 0u, oy, ox, 0u)));
+    } else if (IS(K_RULE_SCORE)) {
+        Seg dmv = segAt(0u), dof = segAt(1u), con = segAt(2u), med = segAt(3u);
+        float k = segRead(con, 0u, oy, ox, 0u) + segRead(med, 0u, 0, 0, 0u) + 1e-3;
+        float s = (segRead(dmv, 0u, oy, ox, 0u) - segRead(dof, 0u, oy, ox, 0u) - 0.5 * k) / (0.25 * k);
+        put(0u, 1.0 / (1.0 + exp(-s)));
+    } else if (IS(K_AXPY_T)) {
+        Seg a = segAt(0u), b = segAt(1u);
+        float k = 1.0 - fcf(FC_T);
+        for (uint c = 0u; c < out_c; ++c) put(c, segRead(a, 0u, oy, ox, c) + k * segRead(b, 0u, oy, ox, c));
+    } else if (IS(K_RULE_CARRY)) {
+        Seg m = segAt(0u), p = segAt(1u);
+        float v = segRead(m, 0u, oy, ox, 0u);
+        put(0u, fcf(FC_HAS_PREV) != 0.0 ? max(v, 0.6 * segRead(p, 0u, oy, ox, 0u)) : v);
+    } else if (IS(K_BLEND_MASK)) {
+        Seg mo = segAt(0u), cl = segAt(1u), m = segAt(2u);
+        float mm = segRead(m, 0u, oy, ox, 0u);
+        for (uint c = 0u; c < 3u; ++c) put(c, (1.0 - mm) * segRead(mo, 0u, oy, ox, c) + mm * segRead(cl, 0u, oy, ox, c));
+    } else if (IS(K_CAM_FLOW)) {                                                                              
+        Seg nd = segAt(0u);
+        float W = float(to.w), H = float(to.h), t = fcf(FC_T);
+        float cl[4] = float[4]((float(ox) + 0.5) / W * 2.0 - 1.0, -((float(oy) + 0.5) / H * 2.0 - 1.0), segRead(nd, 0u, oy, ox, 0u), 1.0);
+        float wd[4];
+        for (int j = 0; j < 4; ++j) { float a = 0.0; for (int i = 0; i < 4; ++i) a += cl[i] * fcf(FC_INV_VP_A + uint(i * 4 + j)); wd[j] = a; }
+        float c4[4];
+        for (int j = 0; j < 4; ++j) {
+            float a = 0.0;
+            for (int i = 0; i < 4; ++i) a += wd[i] * ((1.0 - t) * fcf(FC_VP_A + uint(i * 4 + j)) + t * fcf(FC_VP_B + uint(i * 4 + j)));
+            c4[j] = a;
+        }
+        float px = (c4[0] / c4[3] + 1.0) / 2.0 * W - 0.5, py = (-c4[1] / c4[3] + 1.0) / 2.0 * H - 0.5;
+        put(0u, px - float(ox)); put(1u, py - float(oy));
+    } else if (IS(K_PREP_C)) {                                                           
+        Seg ca = segAt(0u), cb = segAt(1u), vg = segAt(2u);
+        uint vg_base = vg.t.base >> 2u;
+        float c12 = uintBitsToFloat(arena_u32[vg_base + 12u]);
+        float c13 = uintBitsToFloat(arena_u32[vg_base + 13u]);
+        float c14 = uintBitsToFloat(arena_u32[vg_base + 14u]);
+        float dx = clamp(2.0 * float(ox) / (float(to.w) - 1.0) - 1.0, -1.0, 1.0);
+        float dy = clamp(2.0 * float(oy) / (float(to.h) - 1.0) - 1.0, -1.0, 1.0);
+        float fx = dx * dx;
+        float f0 = dx < 0.0 ? fx : 0.0, f1 = dx >= 0.0 ? fx : 0.0, f2 = dy * dy;
+        float invV = exp(-(f0 * c12 + f1 * c13 + f2 * c14));
+        if (to.fmt == 1u && to.c_alloc == 8u) {
+            uint p_idx = uint(oy) * ca.t.w + uint(ox);
+            uint addr_a = (ca.t.base >> 2u) + p_idx * 2u;
+            uint addr_b = (cb.t.base >> 2u) + p_idx * 2u;
+            vec3 va, vb;
+#ifndef MLOF2_DX
+            if (extIn()) { va = extCol(false, ox, oy) * invV; vb = extCol(true, ox, oy) * invV; } else
+#endif
+            {
+                uint wa0 = arena_u32[addr_a], wa1 = arena_u32[addr_a + 1u];
+                uint wb0 = arena_u32[addr_b], wb1 = arena_u32[addr_b + 1u];
+                va = vec3(unpackHalf2x16(wa0), unpackHalf2x16(wa1).x) * invV;
+                vb = vec3(unpackHalf2x16(wb0), unpackHalf2x16(wb1).x) * invV;
+            }
+#ifndef MLOF2_DX
+            imageStore(uImgCabA, ivec2(ox, oy), vec4(va, 0.0));
+            imageStore(uImgCabB, ivec2(ox, oy), vec4(vb, 0.0));
+            return;
+#else
+            uint w_base = (to.base >> 2u) + (uint(oy) * to.w + uint(ox)) * 4u;
+            arena_u32[w_base + 0u] = packHalf2x16(vec2(va.x, va.y));
+            arena_u32[w_base + 1u] = packHalf2x16(vec2(va.z, 0.0));
+            arena_u32[w_base + 2u] = packHalf2x16(vec2(vb.x, vb.y));
+            arena_u32[w_base + 3u] = packHalf2x16(vec2(vb.z, 0.0));
+            return;
+#endif
+        }
+        for (uint c = 0u; c < 3u; ++c) put(c, segRead(ca, 0u, oy, ox, c) * invV);
+        put(3u, 0.0);
+        for (uint c = 0u; c < 3u; ++c) put(4u + c, segRead(cb, 0u, oy, ox, c) * invV);
+        put(7u, 0.0);
+    } else if (IS(K_PREP_F)) {                                                                                
+        Seg mv = segAt(0u), mvv = segAt(1u), map = segAt(2u), of = segAt(3u), ofp = segAt(4u);
+        vec2 m = vec2(segRead(mv, 0u, oy, ox, 0u), segRead(mv, 0u, oy, ox, 1u)), o = vec2(segRead(of, 0u, oy, ox, 0u), segRead(of, 0u, oy, ox, 1u));
+        float vv = segRead(mvv, 0u, oy, ox, 0u);
+        put(0u, m.x * vv); put(1u, m.y * vv);
+        put(2u, m.x + segBilinearZ(map, 0u, float(ox) + m.x, float(oy) + m.y, 0u));
+        put(3u, m.y + segBilinearZ(map, 0u, float(ox) + m.x, float(oy) + m.y, 1u));
+        put(4u, o.x + segBilinearZ(ofp, 0u, float(ox) + o.x, float(oy) + o.y, 0u));
+        put(5u, o.y + segBilinearZ(ofp, 0u, float(ox) + o.x, float(oy) + o.y, 1u));
+    } else if (IS(K_BLEND_PREP)) {                                                                       
+        Seg lg = segAt(0u), cd = segAt(1u), oa = segAt(2u), ob = segAt(3u);
+        float l[4], mx = -1e30, sw = 0.0;
+        vec4 l4 = bilUp4(lg, ox, oy, to.w, to.h);
+        for (uint i = 0u; i < 4u; ++i) { l[i] = l4[i]; mx = max(mx, l[i]); }
+        for (uint i = 0u; i < 4u; ++i) { l[i] = exp(l[i] - mx); sw += l[i]; }
+        for (uint i = 0u; i < 4u; ++i) l[i] /= sw;
+        float c[12];
+        vec4 c0 = segRead4(cd, 0u, oy, ox, 0u), c1 = segRead4(cd, 0u, oy, ox, 4u), c2 = segRead4(cd, 0u, oy, ox, 8u);
+        for (uint i = 0u; i < 4u; ++i) { c[i] = c0[i]; c[4u + i] = c1[i]; c[8u + i] = c2[i]; }
+        for (uint k = 0u; k < 3u; ++k) put(k, clamp(l[0] * c[k] + l[1] * c[3u + k] + l[2] * c[6u + k] + l[3] * c[9u + k], 0.0, 1.0));
+        for (uint i = 0u; i < 4u; ++i) put(3u + i, l[i]);
+        float s2 = max(l[0] + l[1], 1e-6);
+        float fa = segRead(oa, 0u, oy, ox, 0u), fb = segRead(ob, 0u, oy, ox, 0u);
+        float d01 = 0.0, d23 = 0.0;
+        for (uint k = 0u; k < 3u; ++k) {
+            float mo = (l[0] / s2) * c[k] + (l[1] / s2) * c[3u + k];
+            put(7u + k, fa > 0.5 ? c[3u + k] : (fb > 0.5 ? c[k] : mo));
+            d01 += abs(c[k] - c[3u + k]); d23 += abs(c[6u + k] - c[9u + k]);
+        }
+        put(10u, d01 / 3.0); put(11u, d23 / 3.0); put(12u, (fa + fb) > 0.5 ? 1.0 : 0.0);
+    } else if (IS(K_CARRY)) {                                                                                  
+        Seg m1 = segAt(0u), ma = segAt(1u), map = segAt(2u), pm = segAt(3u);
+        float v = segRead(m1, 0u, oy, ox, 0u);
+        if (fcf(FC_HAS_PREV) != 0.0) {
+            vec2 a = vec2(segRead(ma, 0u, oy, ox, 0u), segRead(ma, 0u, oy, ox, 1u));
+            float k = 1.0 - fcf(FC_T);
+            vec2 tp = a + k * vec2(segBilinearZ(map, 0u, float(ox) + a.x, float(oy) + a.y, 0u), segBilinearZ(map, 0u, float(ox) + a.x, float(oy) + a.y, 1u));
+            v = max(v, 0.6 * segBilinearZ(pm, 0u, float(ox) + tp.x, float(oy) + tp.y, 0u));
+        }
+        put(0u, v);
+    } else if (IS(K_CAM_INV)) {                                                                                   
+        Seg nd = segAt(0u);
+        uint w = nd.t.w, h = nd.t.h;
+        vec2 yv = vec2(float(ox), float(oy));
+        vec2 q = yv - camAt(nd, oy, ox);
+        for (int k = 0; k < 4; ++k) { ivec2 p = nearestB(q, w, h); q = yv - camAt(nd, p.y, p.x); }
+        ivec2 pq = nearestB(q, w, h);
+        vec2 r = abs(q + camAt(nd, pq.y, pq.x) - yv);
+        bool inb = q.x >= 0.0 && q.x <= float(w) - 1.0 && q.y >= 0.0 && q.y <= float(h) - 1.0;
+        bool good = max(r.x, r.y) <= 1.0 && inb;
+        bool oob = q.x < -0.5 || q.x > float(w) - 0.5 || q.y < -0.5 || q.y > float(h) - 0.5;
+        vec2 q0 = floor(q), wq = q - q0;
+        vec2 fx = vec2(0.0);
+        for (int j = 0; j < 4; ++j) {
+            int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+            bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);                                   
+            float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+            px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+            fx += wt * camAt(nd, py, px);
+        }
+        put(0u, 0.0 * fx.x); put(1u, 0.0 * fx.y);                                                                
+        put(2u, -fx.x); put(3u, -fx.y);
+        put(4u, good ? 0.0 : 1.0); put(5u, oob ? 1.0 : 0.0);
+    } else if (IS(K_FINAL)) {                                                                                    
+        Seg mo = segAt(0u), cb = segAt(1u), mk = segAt(2u), i2 = segAt(3u), ca = segAt(4u), om = segAt(5u), vg = segAt(6u);
+        float m = segRead(mk, 0u, oy, ox, 0u);
+        vec2 tb = vec2(segRead(i2, 0u, oy, ox, 2u), segRead(i2, 0u, oy, ox, 3u));
+        bool use = segRead(om, 0u, oy, ox, 0u) > 0.5 && segRead(i2, 0u, oy, ox, 4u) < 0.5 && !offFrame(tb.x, tb.y, to.w, to.h);
+        float V = vigV(vg, float(ox), float(oy), float(to.w), float(to.h));
+        vec4 cav = bil4Z(ca, float(ox) + tb.x, float(oy) + tb.y);                                               
+        for (uint c = 0u; c < 3u; ++c) {
+            float col = use ? cav[c] : (1.0 - m) * segRead(mo, 0u, oy, ox, c) + m * segRead(cb, 0u, oy, ox, c);
+            put(c, clamp(col * V, 0.0, 1.0));
+        }
+    } else if (IS(K_PREP)) {                                             
+        Seg ca = segAt(0u), cb = segAt(1u), vg = segAt(2u), mv = segAt(3u), mvv = segAt(4u), map = segAt(5u), of = segAt(6u), ofp = segAt(7u);
+        float V = vigV(vg, float(ox), float(oy), float(to.w), float(to.h));
+        for (uint c = 0u; c < 3u; ++c) put(c, segRead(ca, 0u, oy, ox, c) / V);
+        for (uint c = 0u; c < 3u; ++c) put(3u + c, segRead(cb, 0u, oy, ox, c) / V);
+        vec2 m = vec2(segRead(mv, 0u, oy, ox, 0u), segRead(mv, 0u, oy, ox, 1u)), o = vec2(segRead(of, 0u, oy, ox, 0u), segRead(of, 0u, oy, ox, 1u));
+        float vv = segRead(mvv, 0u, oy, ox, 0u);
+        put(6u, m.x * vv); put(7u, m.y * vv);
+        put(8u, m.x + segBilinearZ(map, 0u, float(ox) + m.x, float(oy) + m.y, 0u));
+        put(9u, m.y + segBilinearZ(map, 0u, float(ox) + m.x, float(oy) + m.y, 1u));
+        put(10u, o.x + segBilinearZ(ofp, 0u, float(ox) + o.x, float(oy) + o.y, 0u));
+        put(11u, o.y + segBilinearZ(ofp, 0u, float(ox) + o.x, float(oy) + o.y, 1u));
+    } else if (IS(K_INV3)) {                                                                     
+        Seg pf = segAt(0u), mvv = segAt(2u), of = segAt(3u), nd = segAt(4u);
+        float r[6];
+        g_t = fcf(FC_T);
+        g_accel = fcf(FC_HAS_PREV) != 0.0;
+        invertT(sub(pf, 6u, 2u), sub(pf, 8u, 2u), true, mvv, r);
+        for (uint i = 0u; i < 6u; ++i) put(i, r[i]);
+        invertT(of, sub(pf, 10u, 2u), false, mvv, r);
+        for (uint i = 0u; i < 6u; ++i) put(6u + i, r[i]);
+        camInvert(nd, r);
+        for (uint i = 0u; i < 6u; ++i) put(12u + i, r[i]);
+    } else if (IS(K_BLEND9)) {                                                                         
+        Seg lg = segAt(0u), pf = segAt(1u), inv = segAt(2u);
+        float l[4], mx = -1e30, sw = 0.0;
+        vec4 l4 = bilUp4(lg, ox, oy, to.w, to.h);
+        for (uint i = 0u; i < 4u; ++i) { l[i] = l4[i]; mx = max(mx, l[i]); }
+        for (uint i = 0u; i < 4u; ++i) { l[i] = exp(l[i] - mx); sw += l[i]; }
+        for (uint i = 0u; i < 4u; ++i) l[i] /= sw;
+        float c[12];
+        candAt(pf, inv, ox, oy, c);
+        for (uint k = 0u; k < 3u; ++k) put(k, clamp(l[0] * c[k] + l[1] * c[3u + k] + l[2] * c[6u + k] + l[3] * c[9u + k], 0.0, 1.0));
+        float s2 = max(l[0] + l[1], 1e-6);
+        bool fa = offFrame(segRead(inv, 0u, oy, ox, 0u), segRead(inv, 0u, oy, ox, 1u), to.w, to.h);
+        bool fb = segRead(inv, 0u, oy, ox, 5u) > 0.5;
+        float d01 = 0.0, d23 = 0.0;
+        for (uint k = 0u; k < 3u; ++k) {
+            float mo = (l[0] / s2) * c[k] + (l[1] / s2) * c[3u + k];
+            put(3u + k, fa ? c[3u + k] : (fb ? c[k] : mo));
+            d01 += abs(c[k] - c[3u + k]); d23 += abs(c[6u + k] - c[9u + k]);
+        }
+        put(6u, d01 / 3.0); put(7u, d23 / 3.0); put(8u, (fa || fb) ? 1.0 : 0.0);
+    } else if (IS(K_FINAL3)) {                                                                                       
+        Seg bp = segAt(0u), mk = segAt(1u), inv = segAt(2u), pf = segAt(3u), vg = segAt(4u);
+        float m = segRead(mk, 0u, oy, ox, 0u);
+        vec2 tb = vec2(segRead(inv, 0u, oy, ox, 14u), segRead(inv, 0u, oy, ox, 15u));
+        bool use = segRead(inv, 0u, oy, ox, 5u) > 0.5 && segRead(inv, 0u, oy, ox, 16u) < 0.5 && !offFrame(tb.x, tb.y, to.w, to.h);
+        float V = vigV(vg, float(ox), float(oy), float(to.w), float(to.h));
+        for (uint c = 0u; c < 3u; ++c) {
+            float col = use ? segBilinearZ(pf, 0u, float(ox) + tb.x, float(oy) + tb.y, c)
+                            : (1.0 - m) * segRead(bp, 0u, oy, ox, 3u + c) + m * segRead(bp, 0u, oy, ox, c);
+            put(c, clamp(col * V, 0.0, 1.0));
+        }
+    } else if (IS(K_WARP_NOISE4)) {                                                                        
+        Seg ca = segAt(0u), cb = segAt(1u), im = segAt(2u), io = segAt(3u);
+        vec4 fl[2];                                                                                               
+        fl[0] = seg4h(im, 0u) ? segLd4h(im, 0u, oy, ox, 0u) : vec4(segRead(im, 0u, oy, ox, 0u), segRead(im, 0u, oy, ox, 1u), segRead(im, 0u, oy, ox, 2u), segRead(im, 0u, oy, ox, 3u));
+        fl[1] = seg4h(io, 0u) ? segLd4h(io, 0u, oy, ox, 0u) : vec4(segRead(io, 0u, oy, ox, 0u), segRead(io, 0u, oy, ox, 1u), segRead(io, 0u, oy, ox, 2u), segRead(io, 0u, oy, ox, 3u));
+        for (uint i = 0u; i < 4u; ++i) {
+            Seg src = (i & 1u) == 0u ? ca : cb;
+            vec2 f2 = (i & 1u) == 0u ? fl[i >> 1u].xy : fl[i >> 1u].zw;
+            float fxv = f2.x, fyv = f2.y;
+            bool off = offFrame(fxv, fyv, to.w, to.h);
+            vec4 b4 = bil4Z(src, float(ox) + fxv, float(oy) + fyv);                                              
+            for (uint c = 0u; c < 3u; ++c)
+                put(3u * i + c, off ? float(hashn(uint(ox), uint(oy), c, i)) / 4294967296.0 : b4[c]);
+        }
+    } else if (IS(K_FEAT4)) {                                                                                    
+        Seg cd = segAt(0u), da = segAt(1u), db = segAt(2u), im = segAt(3u), io = segAt(4u), co = segAt(5u);
+        uint w = cd.t.w, h = cd.t.h;
+        float t = fcf(FC_T), acc[28];
+        for (int i = 0; i < 28; ++i) acc[i] = 0.0;
+        for (int sub = 0; sub < 16; ++sub) {
+            int X = ox * 4 + (sub & 3), Y = oy * 4 + (sub >> 2);
+            float c12[12];
+            for (uint c = 0u; c < 12u; ++c) { c12[c] = segRead(cd, 0u, Y, X, c); acc[c] += c12[c]; }
+            vec2 ma = segRead2(im, 0u, Y, X, 0u), mb = segRead2(im, 0u, Y, X, 2u);
+            vec2 oa = segRead2(io, 0u, Y, X, 0u), ob = segRead2(io, 0u, Y, X, 2u);
+            float x12 = segBilinearZ(da, 0u, float(X) + ma.x, float(Y) + ma.y, 0u);
+            float x13 = segBilinearZ(db, 0u, float(X) + mb.x, float(Y) + mb.y, 0u);
+            acc[12] += x12; acc[13] += x13;
+            acc[14] += segRead(im, 0u, Y, X, 4u); acc[15] += segRead(io, 0u, Y, X, 4u); acc[16] += t;
+            acc[17] += (abs(c12[0] - c12[3]) + abs(c12[1] - c12[4]) + abs(c12[2] - c12[5])) * (4.0 / 3.0);
+            acc[18] += (abs(c12[6] - c12[9]) + abs(c12[7] - c12[10]) + abs(c12[8] - c12[11])) * (4.0 / 3.0);
+            acc[19] += min(length(ma - oa) / 16.0, 4.0);
+                                                                                                     
+            vec2 q = vec2(float(X), float(Y)) + ob, q0 = floor(q), wq = q - q0;
+            vec2 cw = vec2(0.0);
+            for (int j = 0; j < 4; ++j) {
+                int px = int(q0.x) + (j & 1), py = int(q0.y) + (j >> 1);
+                bool in_ = px >= 0 && py >= 0 && px < int(w) && py < int(h);
+                float wt = in_ ? ((j & 1) != 0 ? wq.x : 1.0 - wq.x) * ((j >> 1) != 0 ? wq.y : 1.0 - wq.y) : 0.0;
+                px = clamp(px, 0, int(w) - 1); py = clamp(py, 0, int(h) - 1);
+                cw += wt * vec2(bilUp(co, px, py, w, h, 0u), bilUp(co, px, py, w, h, 1u));
+            }
+            vec2 _scw_acc = vec2(1.0) / (vec2(1.0) + exp(-cw)); acc[20] += _scw_acc.x; acc[21] += _scw_acc.y;
+            acc[22] += min(abs(x12 - x13) * 16.0, 4.0);
+            acc[23] += min(abs(segBilinearZ(da, 0u, float(X) + oa.x, float(Y) + oa.y, 0u) -
+                               segBilinearZ(db, 0u, float(X) + ob.x, float(Y) + ob.y, 0u)) * 16.0, 4.0);
+            acc[24] += offFrameAt(X, Y, ma.x, ma.y, w, h) ? 1.0 : 0.0;
+            acc[25] += segRead(im, 0u, Y, X, 5u);
+            acc[26] += offFrameAt(X, Y, oa.x, oa.y, w, h) ? 1.0 : 0.0;
+            acc[27] += segRead(io, 0u, Y, X, 5u);
+        }
+        for (uint c = 0u; c < 28u; ++c) put(c, acc[c] * (1.0 / 16.0));
+    } else if (IS(K_PREP_H)) {                                                                                       
+        Seg mv = segAt(0u), mvv = segAt(1u), map = segAt(2u), of = segAt(3u), ofp = segAt(4u);
+        vec2 smm = vec2(0.0), sbp = vec2(0.0), sof = vec2(0.0), sobp = vec2(0.0);
+        float sv = 0.0;
+        const uint FW = map.t.w, FH = map.t.h;                                                
+        const bool lane = mv.t.w != FW;                                                                                 
+        const bool of4 = of.t.w != FW;                                                                         
+        const bool point = opi(0) != 0 || lane;                                                                   
+#ifndef MLOF2_DX
+        if (extIn()) {                                                                                                            
+            uint mw = uint(fcf(FC_EXT_MV_W)), mh = uint(fcf(FC_EXT_MV_H)), sw = floatBitsToUint(fcf(FC_EXT_SNAP_W));
+            vec2 sc = vec2(fcf(FC_EXT_MV_SX), fcf(FC_EXT_MV_SY));
+            for (uint i = gid; i < mw * mh; i += ohw) {
+                vec2 fmv = texelFetch(uExtMv, ivec2(i % mw, i / mw), 0).xy * sc;
+                arena_u32[sw + i * 2u] = floatBitsToUint(fmv.x);
+                arena_u32[sw + i * 2u + 1u] = floatBitsToUint(fmv.y);
+            }
+        }
+#endif
+        for (int j = 0; j < 4; ++j) {
+            int X = 2 * ox + (j & 1), Y = 2 * oy + (j >> 1);
+            if (!MLOF2_PREP_MV_ONLY) {
+                vec2 o = of4 ? ofUpAt(of, X, Y, FW, FH) : segRead2(of, 0u, Y, X, 0u);
+                sof += o;
+                sobp += o + (of4 ? warpUpZ(ofp, float(X) + o.x, float(Y) + o.y, FW, FH) : bil2Z(ofp, float(X) + o.x, float(Y) + o.y));
+            }
+            if (!point) {
+                vec2 m = segRead2(mv, 0u, Y, X, 0u);
+                float v = segRead(mvv, 0u, Y, X, 0u);
+                smm += m * v; sv += v;
+                sbp += m + (fcf(FC_EXT_MVAP) > 0.5 ? extMvPrevBil(float(X) + m.x, float(Y) + m.y, FW, FH) : bil2Z(map, float(X) + m.x, float(Y) + m.y));
+            }
+        }
+        if (point) {                                                                                      
+            int X = 2 * ox + 1, Y = 2 * oy + 1;
+            vec2 m; float v;
+#ifndef MLOF2_DX
+            if (extIn()) { m = extMvAt(X, Y); v = 1.0; } else
+#endif
+            { m = lane ? segRead2(mv, 0u, oy, ox, 0u) : segRead2(mv, 0u, Y, X, 0u); v = lane ? segRead(mvv, 0u, oy, ox, 0u) : segRead(mvv, 0u, Y, X, 0u); }
+            smm = 4.0 * (m * v); sv = 4.0 * v;
+            sbp = 4.0 * (m + (fcf(FC_EXT_MVAP) > 0.5 ? extMvPrevBil(float(X) + m.x, float(Y) + m.y, FW, FH) : bil2Z(map, float(X) + m.x, float(Y) + m.y)));
+        }
+        if (to.fmt == 1u && to.c_alloc == 10u) {
+            uint w_base = (to.base >> 2u) + (uint(oy) * to.w + uint(ox)) * 5u;
+            arena_u32[w_base + 0u] = packHalf2x16(smm * 0.125);
+            arena_u32[w_base + 1u] = packHalf2x16(sbp * 0.125);
+            arena_u32[w_base + 2u] = packHalf2x16(sof * 0.125);
+            arena_u32[w_base + 3u] = packHalf2x16(sobp * 0.125);
+            arena_u32[w_base + 4u] = packHalf2x16(vec2(sv * 0.25 > 0.5 ? 1.0 : 0.0, 0.0));
+            return;
+        }
+        put(0u, smm.x * 0.125); put(1u, smm.y * 0.125); put(2u, sbp.x * 0.125); put(3u, sbp.y * 0.125);
+        put(4u, sof.x * 0.125); put(5u, sof.y * 0.125); put(6u, sobp.x * 0.125); put(7u, sobp.y * 0.125);
+        put(8u, sv * 0.25 > 0.5 ? 1.0 : 0.0);
+    } else if (IS(K_Q_CAND)) {                                                                                      
+        Seg qp = segAt(0u), im = segAt(1u), io = segAt(2u);
+        vec4 fm = vec4(0.0), fo = vec4(0.0), gm = vec4(0.0), go = vec4(0.0);
+        for (int j = 0; j < 4; ++j) {
+            int X = 2 * ox + (j & 1), Y = 2 * oy + (j >> 1);
+            fm += segRead4(im, 0u, Y, X, 0u); fo += segRead4(io, 0u, Y, X, 0u);
+            gm.xy += segRead2(im, 0u, Y, X, 4u);
+            go.xy += segRead2(io, 0u, Y, X, 4u);
+        }
+        fm *= 0.125; fo *= 0.125; gm *= 0.25; go *= 0.25;
+        vec2 fl[4] = vec2[4](fm.xy, fm.zw, fo.xy, fo.zw);
+#ifndef MLOF2_DX
+        for (uint i = 0u; i < 4u; ++i) {
+            bool off = offFrame(fl[i].x, fl[i].y, to.w, to.h);
+            vec2 uv = (vec2(ox, oy) + fl[i] + 0.5) / vec2(to.w, to.h);
+            vec4 b4 = (i & 1u) == 0u ? textureLod(uTexQpA, uv, 0.0) : textureLod(uTexQpB, uv, 0.0);
+            for (uint c = 0u; c < 3u; ++c)
+                put(3u * i + c, off ? float(hashn(uint(ox), uint(oy), c, i)) / 4294967296.0 : b4[c]);
+        }
+#else
+        Seg src2[2] = Seg[2](sub(qp, 0u, 3u), sub(qp, 4u, 3u));
+        for (uint i = 0u; i < 4u; ++i) {
+            bool off = offFrame(fl[i].x, fl[i].y, to.w, to.h);
+            vec4 b4 = bil4Z(src2[i & 1u], float(ox) + fl[i].x, float(oy) + fl[i].y);
+            for (uint c = 0u; c < 3u; ++c)
+                put(3u * i + c, off ? float(hashn(uint(ox), uint(oy), c, i)) / 4294967296.0 : b4[c]);
+        }
+#endif
+        for (uint i = 0u; i < 4u; ++i) { put(12u + 2u * i, fl[i].x); put(13u + 2u * i, fl[i].y); }
+        put(20u, gm.x > 0.5 ? 1.0 : 0.0); put(21u, go.x > 0.5 ? 1.0 : 0.0);
+        put(22u, gm.y > 0.5 ? 1.0 : 0.0); put(23u, go.y > 0.5 ? 1.0 : 0.0);
+    } else if (IS(K_Q_FEAT)) {                                                                                       
+        Seg qc = segAt(0u), qp = segAt(1u), co = segAt(2u);
+        vec4 c0 = segRead4(qc, 0u, oy, ox, 0u), c1 = segRead4(qc, 0u, oy, ox, 4u), c2 = segRead4(qc, 0u, oy, ox, 8u);
+        float c[12] = float[12](c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w, c2.x, c2.y, c2.z, c2.w);
+        vec4 f0 = segRead4(qc, 0u, oy, ox, 12u), f1 = segRead4(qc, 0u, oy, ox, 16u), g4 = segRead4(qc, 0u, oy, ox, 20u);
+        vec2 ma = f0.xy, mb = f0.zw, oa = f1.xy, ob = f1.zw;
+        float X = float(ox), Y = float(oy);
+        float x12 = segBilinearZ(qp, 0u, X + ma.x, Y + ma.y, 8u), x13 = segBilinearZ(qp, 0u, X + mb.x, Y + mb.y, 9u);
+        for (uint i = 0u; i < 12u; ++i) put(i, c[i]);
+        put(12u, x12); put(13u, x13); put(14u, g4.x); put(15u, g4.y); put(16u, fcf(FC_T));
+        put(17u, (abs(c[0] - c[3]) + abs(c[1] - c[4]) + abs(c[2] - c[5])) * (4.0 / 3.0));
+        put(18u, (abs(c[6] - c[9]) + abs(c[7] - c[10]) + abs(c[8] - c[11])) * (4.0 / 3.0));
+        put(19u, min(length(ma - oa) * 4.0 / 16.0, 4.0));
+        vec2 cw = bil2Z(co, X + ob.x, Y + ob.y);
+        vec2 _scw_put = vec2(1.0) / (vec2(1.0) + exp(-cw)); put(20u, _scw_put.x); put(21u, _scw_put.y);
+        put(22u, min(abs(x12 - x13) * 16.0, 4.0));
+        put(23u, min(abs(segBilinearZ(qp, 0u, X + oa.x, Y + oa.y, 8u) - segBilinearZ(qp, 0u, X + ob.x, Y + ob.y, 9u)) * 16.0, 4.0));
+        put(24u, offFrame(ma.x, ma.y, to.w, to.h) ? 1.0 : 0.0); put(25u, g4.z);
+        put(26u, offFrame(oa.x, oa.y, to.w, to.h) ? 1.0 : 0.0); put(27u, g4.w);
+    } else if (IS(K_Q_RULE1)) {                                                                                
+        Seg lg = segAt(0u), qc = segAt(1u);
+        int w = int(to.w), h = int(to.h);
+        vec4 c0 = segRead4(qc, 0u, oy, ox, 0u), c1 = segRead4(qc, 0u, oy, ox, 4u), c2 = segRead4(qc, 0u, oy, ox, 8u);
+        float dmv = (abs(c0.x - c0.w) + abs(c0.y - c1.x) + abs(c0.z - c1.y)) / 3.0;
+        float dof = (abs(c1.z - c2.y) + abs(c1.w - c2.z) + abs(c2.x - c2.w)) / 3.0;
+                                                                                                           
+        bool one_ = false;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                int x = ox + dx, y = oy + dy;
+                bool q = qOne(qc, clamp(x, 0, w - 1), clamp(y, 0, h - 1));
+                one_ = one_ || (x >= 0 && y >= 0 && x < w && y < h && q);
+            }
+        float lxp = qMoLuma(lg, qc, min(ox + 1, w - 1), oy), lxm = qMoLuma(lg, qc, max(ox - 1, 0), oy);
+        float lyp = qMoLuma(lg, qc, ox, min(oy + 1, h - 1)), lym = qMoLuma(lg, qc, ox, max(oy - 1, 0));
+        float gx = ox > 0 && ox < w - 1 ? abs(lxp - lxm) : 0.0;
+        float gy = oy > 0 && oy < h - 1 ? abs(lyp - lym) : 0.0;
+        put(0u, one_ ? 0.0 : dmv); put(1u, dof); put(2u, gx + gy);
+    } else if (IS(K_Q_RULE2)) {                                                         
+        Seg r1 = segAt(0u), md = segAt(1u), qc = segAt(2u), qp = segAt(3u), pm = segAt(4u);
+        int w = int(to.w), h = int(to.h);
+        float med = segRead(md, 0u, 0, 0, 0u), m = 0.0, bf = 0.0;
+        const bool bfOn = opw(OP_OUT_C) >= 2u;                                                                
+        const float bm = opf(0), bw = opf(1);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                int x = clamp(ox + dx, 0, w - 1), y = clamp(oy + dy, 0, h - 1);                                       
+                m = max(m, qScore(r1, med, x, y));
+                if (bfOn) bf = max(bf, qBothFail(r1, med, x, y, bm, bw));
+            }
+        if (fcf(FC_HAS_PREV) != 0.0) {
+            vec2 ma = vec2(segRead(qc, 0u, oy, ox, 12u), segRead(qc, 0u, oy, ox, 13u));
+            vec2 tp = ma + (1.0 - fcf(FC_T)) * bil2Z(sub(qp, 10u, 2u), float(ox) + ma.x, float(oy) + ma.y);
+            m = max(m, 0.6 * segBilinearZ(pm, 0u, float(ox) + tp.x, float(oy) + tp.y, 0u));
+        }
+        if (bfOn && opf(2) > 0.0 && bf > 0.05) {                                                                                                      
+            const float be = opf(2);                                                        
+            bool edge = false;
+            for (int dy = -4; dy <= 4 && !edge; ++dy)
+                for (int dx = -4; dx <= 4; ++dx) {
+                    int x = ox + dx, y = oy + dy;
+                    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                    vec2 a = vec2(segRead(qc, 0u, y, x, 12u), segRead(qc, 0u, y, x, 13u));
+                    if (x + 1 < w && length(vec2(segRead(qc, 0u, y, x + 1, 12u), segRead(qc, 0u, y, x + 1, 13u)) - a) > be) { edge = true; break; }
+                    if (y + 1 < h && length(vec2(segRead(qc, 0u, y + 1, x, 12u), segRead(qc, 0u, y + 1, x, 13u)) - a) > be) { edge = true; break; }
+                }
+                                                                                                                      
+                                                                                                                      
+                                                                                                
+            const float reach = opf(3);
+            if (!edge && reach > 0.0) {
+                const vec2 a0 = vec2(segRead(qc, 0u, oy, ox, 12u), segRead(qc, 0u, oy, ox, 13u));
+                const int RR[9] = int[9](2, 3, 4, 6, 8, 12, 16, 24, 32);
+                const ivec2 DD[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1), ivec2(1, 1), ivec2(-1, 1), ivec2(1, -1), ivec2(-1, -1));
+                for (int r = 0; r < 9 && !edge; ++r)
+                    for (int d = 0; d < 8; ++d) {
+                        int x = ox + DD[d].x * RR[r], y = oy + DD[d].y * RR[r];
+                        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                        vec2 b = vec2(segRead(qc, 0u, y, x, 12u), segRead(qc, 0u, y, x, 13u));
+                        if (length(b - a0) > max(be, reach * float(RR[r]))) { edge = true; break; }
+                    }
+            }
+            if (edge) bf = 0.0;
+        }
+        put(0u, m);
+        if (bfOn) put(1u, bf);
+    } else if (IS(K_CAM_INV_Q)) {                                                                            
+        Seg nd = segAt(0u);
+        g_cstep = int(nd.t.w / to.w);
+        float r[6];
+        camInvert(nd, r);
+        put(0u, r[2]);
+        put(1u, r[3]);
+        put(2u, r[4]);
+    } else if (IS(K_FINAL4)) {                                                                                            
+        Seg cab = segAt(0u), im = segAt(1u), io = segAt(2u), lg = segAt(3u), mk = segAt(4u), ic = segAt(5u), vg = segAt(6u);
+        vec4 fm, fo, lgu; bool oob; float mm, bfu = 0.0;
+        const bool bfOn = mk.c >= 2u;                                                  
+                                                                                                                
+        const bool fast = segWords(im) && segWords(io) && segWords(lg) && segWords(mk) && im.c >= 6u && io.t.w == im.t.w &&
+                          io.t.h == im.t.h && mk.t.w == lg.t.w && mk.t.h == lg.t.h;
+        if (fast) {
+            ivec2 a0, a1, b0, b1; vec2 la, lb;
+            upAt(im.t.w, im.t.h, ox, oy, to.w, to.h, a0, a1, la);
+            upAt(lg.t.w, lg.t.h, ox, oy, to.w, to.h, b0, b1, lb);
+            ivec2 pa[4] = ivec2[4](a0, ivec2(a1.x, a0.y), ivec2(a0.x, a1.y), a1), pb[4] = ivec2[4](b0, ivec2(b1.x, b0.y), ivec2(b0.x, b1.y), b1);
+            uint wm[12], wo[8], wl[8], wk[4];
+            for (uint j = 0u; j < 4u; ++j) {
+                uint im_ = segByteAddr(im, 0u, pa[j].y, pa[j].x, 0u) >> 2u, io_ = segByteAddr(io, 0u, pa[j].y, pa[j].x, 0u) >> 2u;
+                uint lg_ = segByteAddr(lg, 0u, pb[j].y, pb[j].x, 0u) >> 2u, mk_ = segByteAddr(mk, 0u, pb[j].y, pb[j].x, 0u) >> 2u;
+                wm[3u * j] = arena_u32[im_]; wm[3u * j + 1u] = arena_u32[im_ + 1u]; wm[3u * j + 2u] = arena_u32[im_ + 2u];
+                wo[2u * j] = arena_u32[io_]; wo[2u * j + 1u] = arena_u32[io_ + 1u];
+                wl[2u * j] = arena_u32[lg_]; wl[2u * j + 1u] = arena_u32[lg_ + 1u];
+                wk[j] = arena_u32[mk_];
+            }
+            vec4 tm[4], to4[4], tl[4]; float t5[4], tk[4], tb[4];
+            for (uint j = 0u; j < 4u; ++j) {
+                tm[j] = vec4(unpackHalf2x16(wm[3u * j]), unpackHalf2x16(wm[3u * j + 1u])); t5[j] = unpackHalf2x16(wm[3u * j + 2u]).y;
+                to4[j] = vec4(unpackHalf2x16(wo[2u * j]), unpackHalf2x16(wo[2u * j + 1u]));
+                tl[j] = vec4(unpackHalf2x16(wl[2u * j]), unpackHalf2x16(wl[2u * j + 1u])); tk[j] = unpackHalf2x16(wk[j]).x; tb[j] = unpackHalf2x16(wk[j]).y;
+            }
+            fm = ((1.0 - la.y) * ((1.0 - la.x) * tm[0] + la.x * tm[1]) + la.y * ((1.0 - la.x) * tm[2] + la.x * tm[3])) * 2.0;
+            fo = ((1.0 - la.y) * ((1.0 - la.x) * to4[0] + la.x * to4[1]) + la.y * ((1.0 - la.x) * to4[2] + la.x * to4[3])) * 2.0;
+            oob = (1.0 - la.y) * ((1.0 - la.x) * t5[0] + la.x * t5[1]) + la.y * ((1.0 - la.x) * t5[2] + la.x * t5[3]) > 0.5;
+            lgu = (1.0 - lb.y) * ((1.0 - lb.x) * tl[0] + lb.x * tl[1]) + lb.y * ((1.0 - lb.x) * tl[2] + lb.x * tl[3]);
+            mm = (1.0 - lb.y) * ((1.0 - lb.x) * tk[0] + lb.x * tk[1]) + lb.y * ((1.0 - lb.x) * tk[2] + lb.x * tk[3]);
+            if (bfOn) bfu = (1.0 - lb.y) * ((1.0 - lb.x) * tb[0] + lb.x * tb[1]) + lb.y * ((1.0 - lb.x) * tb[2] + lb.x * tb[3]);
+        } else {
+            fm = bilUp4(im, ox, oy, to.w, to.h) * 2.0; fo = bilUp4(io, ox, oy, to.w, to.h) * 2.0;
+            oob = bilUp(im, ox, oy, to.w, to.h, 5u) > 0.5;
+            lgu = bilUp4(lg, ox, oy, to.w, to.h); mm = bilUp(mk, ox, oy, to.w, to.h, 0u);
+            if (bfOn) bfu = bilUp(mk, ox, oy, to.w, to.h, 1u);
+        }
+        vec2 fl[4] = vec2[4](fm.xy, fm.zw, fo.xy, fo.zw);
+        vec3 cd[4];
+#ifndef MLOF2_DX
+        for (uint i = 0u; i < 4u; ++i) {
+            bool off = offFrame(fl[i].x, fl[i].y, to.w, to.h);
+            vec2 uv = (vec2(ox, oy) + fl[i] + 0.5) / vec2(to.w, to.h);
+            vec4 b4 = (i & 1u) == 0u ? textureLod(uTexCabA, uv, 0.0) : textureLod(uTexCabB, uv, 0.0);
+            for (uint c = 0u; c < 3u; ++c) cd[i][c] = off ? float(hashn(uint(ox), uint(oy), c, i)) / 4294967296.0 : b4[c];
+        }
+#else
+        Seg ca = sub(cab, 0u, 3u), cb = sub(cab, 4u, 3u);
+        for (uint i = 0u; i < 4u; ++i) {
+            bool off = offFrame(fl[i].x, fl[i].y, to.w, to.h);
+            vec4 b4 = bil4Z((i & 1u) == 0u ? ca : cb, float(ox) + fl[i].x, float(oy) + fl[i].y);
+            for (uint c = 0u; c < 3u; ++c) cd[i][c] = off ? float(hashn(uint(ox), uint(oy), c, i)) / 4294967296.0 : b4[c];
+        }
+#endif
+        vec4 w = softmax4(lgu);
+        vec3 colr = clamp(w.x * cd[0] + w.y * cd[1] + w.z * cd[2] + w.w * cd[3], 0.0, 1.0);
+        float s2 = max(w.x + w.y, 1e-6);
+        bool offa = offFrame(fl[0].x, fl[0].y, to.w, to.h);
+        vec3 mo = offa ? cd[1] : (oob ? cd[0] : (w.x / s2) * cd[0] + (w.y / s2) * cd[1]);
+        vec3 col = (1.0 - mm) * mo + mm * colr;
+        if (bfOn) {                                                                                                 
+            vec3 near = fcf(FC_T) <= 0.5 ? cd[0] : cd[1];
+            near = offa ? cd[1] : (oob ? cd[0] : near);
+            if (opi(1) == 1 && !offa && !oob) {                                                                       
+                float wv[4] = float[4](w.x, w.y, w.z, w.w);                                                         
+                int ib = -1; float wb = -1.0;
+                for (int i = 0; i < 4; ++i)
+                    if (!offFrame(fl[i].x, fl[i].y, to.w, to.h) && wv[i] > wb) { ib = i; wb = wv[i]; }
+                if (ib >= 0) near = cd[ib];
+            }
+            col = col + bfu * (near - col);
+        }
+        if (oob) {                                                                                               
+            bool use_homog = (opw(OP_NSEG) >= 8u) && (segRead(segAt(7u), 0u, 0, 0, 9u) > 0.5);
+            if (use_homog) {
+                Seg ho = segAt(7u);
+                mat3 H;
+                H[0][0] = segRead(ho, 0u, 0, 0, 0u);
+                H[0][1] = segRead(ho, 0u, 0, 0, 1u);
+                H[0][2] = segRead(ho, 0u, 0, 0, 2u);
+                H[1][0] = segRead(ho, 0u, 0, 0, 3u);
+                H[1][1] = segRead(ho, 0u, 0, 0, 4u);
+                H[1][2] = segRead(ho, 0u, 0, 0, 5u);
+                H[2][0] = segRead(ho, 0u, 0, 0, 6u);
+                H[2][1] = segRead(ho, 0u, 0, 0, 7u);
+                H[2][2] = segRead(ho, 0u, 0, 0, 8u);
+
+                float W_f = float(to.w), H_f = float(to.h);
+                float X = (float(ox) + 0.5 - 0.5 * W_f) / W_f;
+                float Y = (float(oy) + 0.5 - 0.5 * H_f) / W_f;
+                vec3 Q = H * vec3(X, Y, 1.0);
+                vec2 UV = Q.xy / max(abs(Q.z), 1e-7);
+                float ox_new = UV.x * W_f + 0.5 * W_f;
+                float oy_new = UV.y * W_f + 0.5 * H_f;
+
+                if (ox_new >= 0.0 && ox_new < W_f && oy_new >= 0.0 && oy_new < H_f) {
+                    vec2 uv2 = vec2(ox_new, oy_new) / vec2(to.w, to.h);
+#ifndef MLOF2_DX
+                    col = textureLod(uTexCabA, uv2, 0.0).xyz;
+#else
+                    Seg ca = sub(cab, 0u, 3u);
+                    col = bil4Z(ca, ox_new - 0.5, oy_new - 0.5).xyz;
+#endif
+                }
+            } else {
+                bool hole2 = bilUp(ic, ox, oy, to.w, to.h, 2u) > 0.5;                                       
+                vec2 to2 = vec2(bilUp(ic, ox, oy, to.w, to.h, 0u), bilUp(ic, ox, oy, to.w, to.h, 1u)) * 4.0;
+#ifndef MLOF2_DX
+                if (!hole2 && !offFrame(to2.x, to2.y, to.w, to.h)) {
+                    vec2 uv2 = (vec2(ox, oy) + to2 + 0.5) / vec2(to.w, to.h);
+                    col = textureLod(uTexCabA, uv2, 0.0).xyz;
+                }
+#else
+                Seg ca = sub(cab, 0u, 3u);
+                if (!hole2 && !offFrame(to2.x, to2.y, to.w, to.h)) col = bil4Z(ca, float(ox) + to2.x, float(oy) + to2.y).xyz;
+#endif
+            }
+        }
+        float V = vigV(vg, float(ox), float(oy), float(to.w), float(to.h));
+        if (to.fmt == 0u && to.c_alloc == 3u) {
+            uint w_base = (to.base >> 2u) + (uint(oy) * to.w + uint(ox)) * 3u;
+            arena_u32[w_base + 0u] = floatBitsToUint(clamp(col.x * V, 0.0, 1.0));
+            arena_u32[w_base + 1u] = floatBitsToUint(clamp(col.y * V, 0.0, 1.0));
+            arena_u32[w_base + 2u] = floatBitsToUint(clamp(col.z * V, 0.0, 1.0));
+            return;
+        }
+        if (to.fmt == 1u && to.c_alloc == 4u) {                                                            
+            uint w_base = (to.base >> 2u) + (uint(oy) * to.w + uint(ox)) * 2u;
+            vec3 o = clamp(col * V, 0.0, 1.0);
+#ifndef MLOF2_DX
+            if (fcf(FC_EXT_OUT) > 0.5) {                                                                          
+                uint dw = uint(fcf(FC_EXT_DISP_W)), dh = uint(fcf(FC_EXT_DISP_H));
+                if (uint(ox) >= dw || uint(oy) >= dh) return;
+                vec3 rgb = clamp(vec3(unpackHalf2x16(packHalf2x16(o.xy)), unpackHalf2x16(packHalf2x16(vec2(o.z, 0.0))).x), 0.0, 1.0);
+                uint hm = uint(fcf(FC_EXT_HUD));
+                if (hm != 0u) {
+                    vec3 fullColor = texelFetch(uExtFull, ivec2(ox, oy), 0).rgb;
+                    vec3 sceneColor = texelFetch(uExtColB, ivec2(ox, oy), 0).rgb;
+                    vec3 tolerance = hm == 2u ? abs(sceneColor) * vec3(1.0 / 64.0, 1.0 / 64.0, 1.0 / 32.0) + vec3(1.0 / 255.0)
+                                              : vec3(1.0 / 4096.0);
+                    if (any(greaterThan(abs(fullColor - sceneColor), tolerance))) rgb = fullColor;
+                }
+                imageStore(uExtOut, ivec2(ox, oy), vec4(rgb, 1.0));
+                return;
+            }
+#endif
+            arena_u32[w_base] = packHalf2x16(o.xy);
+            arena_u32[w_base + 1u] = packHalf2x16(vec2(o.z, 0.0));
+            return;
+        }
+        for (uint c = 0u; c < 3u; ++c) put(c, clamp(col[c] * V, 0.0, 1.0));
+    } else if (IS(K_TRAIL_SEL)) {
+        Seg cl = segAt(0u), cv = segAt(1u), i2 = segAt(2u), om = segAt(3u);
+        bool use = segRead(om, 0u, oy, ox, 0u) > 0.5 && segRead(i2, 0u, oy, ox, 4u) < 0.5 &&
+                   !offFrame(segRead(i2, 0u, oy, ox, 2u), segRead(i2, 0u, oy, ox, 3u), to.w, to.h);
+        for (uint c = 0u; c < 3u; ++c) put(c, use ? segRead(cv, 0u, oy, ox, c) : segRead(cl, 0u, oy, ox, c));
+    
+    }
+
+    if (out_coff + out_c == to.c) wzeroPad(to, 0u, oy, ox);
+    wflush();
+#endif
+}

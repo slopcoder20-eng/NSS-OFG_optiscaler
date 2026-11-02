@@ -1,0 +1,77 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+layout(local_size_x=32) in;
+layout(std430,binding=0) readonly buffer Inputs { float x[]; };
+layout(std430,binding=1) readonly buffer Weights { uint weights[]; };
+layout(std430,binding=2) writeonly buffer Outputs { float y[]; };
+layout(std430,binding=3) readonly buffer Skip { float skip_values[]; };
+layout(std430,binding=4) readonly buffer Quantized { uint q[]; };
+layout(std430,binding=5) writeonly buffer NextQuantized { uint qnext[]; };
+layout(push_constant) uniform Params {
+    uint width,height,cin,cout,weight_offset,bias_offset,activation,use_skip;
+    float radius; uint next_scale_offset;
+} p;
+shared uint aTile[64];
+
+shared int cTile[512];
+int byteSigned(uint word,uint lane) { return bitfieldExtract(int(word),int(lane*8),8); }
+void main() {
+    uint pixel0=(gl_WorkGroupID.x+gl_WorkGroupID.z*gl_NumWorkGroups.x)*16, oc0=gl_WorkGroupID.y*32;
+    uint lane=gl_LocalInvocationID.x;
+    coopmat<int32_t,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> acc;
+    acc=coopmat<int32_t,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>(0);
+    coopmat<int32_t,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator> acc1;
+    acc1=coopmat<int32_t,gl_ScopeSubgroup,16,16,gl_MatrixUseAccumulator>(0);
+    for(uint k0=0;k0<9*p.cin;k0+=16) {
+        for(uint j=lane;j<64;j+=32) {
+            uint row=j/4,k=k0+(j%4)*4,pixel=pixel0+row;
+            uint av=0;
+            if(pixel<p.width*p.height && k<9*p.cin) {
+                uint tap=k/p.cin,ic=k%p.cin;
+                int xx=int(pixel%p.width)+int(tap%3)-1;
+                int yy=int(pixel/p.width)+int(tap/3)-1;
+                if(xx>=0&&yy>=0&&xx<int(p.width)&&yy<int(p.height))
+                    av=q[(uint(yy)*p.width+uint(xx))*(p.cin/4)+ic/4];
+            }
+            aTile[j]=av;
+        }
+        barrier();
+        coopmat<int8_t,gl_ScopeSubgroup,16,16,gl_MatrixUseA> a;
+        coopmat<int8_t,gl_ScopeSubgroup,16,16,gl_MatrixUseB> b;
+        coopMatLoad(a,aTile,0,4,gl_CooperativeMatrixLayoutRowMajor);
+        uint base=p.bias_offset+2*p.cout+p.cin;
+        uint tile=(k0/16)*((p.cout+15)/16)+gl_WorkGroupID.y*2;
+        coopMatLoad(b,weights,base+tile*64,4,gl_CooperativeMatrixLayoutRowMajor);        acc=coopMatMulAdd(a,b,acc);
+        coopMatLoad(b,weights,base+(tile+1)*64,4,gl_CooperativeMatrixLayoutRowMajor);
+        acc1=coopMatMulAdd(a,b,acc1);
+        barrier();
+    }
+    coopMatStore(acc,cTile,0,16,gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1,cTile,256,16,gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for(uint j=lane;j<512;j+=32) {
+        uint pixel=pixel0+(j%256)/16,oc=oc0+(j/256)*16+j%16;
+        if(pixel>=p.width*p.height||oc>=p.cout) continue;
+        uint index=pixel*p.cout+oc;
+        float value=float(cTile[j]+int(weights[p.bias_offset+oc]))*uintBitsToFloat(weights[p.bias_offset+p.cout+oc]);
+        if(p.use_skip!=0)value+=skip_values[index];
+        if(p.activation==1)value=max(value,0.0);
+        if(p.activation==2)value=p.radius*tanh(value);
+        y[index]=value;
+        float scale=uintBitsToFloat(weights[p.next_scale_offset+oc]);
+        cTile[j]=int(clamp(roundEven(value/scale),-127.0,127.0));
+    }
+    barrier();
+    for(uint j=lane;j<128;j+=32) {
+        uint pixel=pixel0+j/8, group=j%8, channel=group*4;
+        if(pixel>=p.width*p.height) continue;
+        uint base=(channel/16)*256+(j/8)*16+channel%16;
+        uint word=0;
+        for(uint c=0;c<4;c++) word|=(uint(cTile[base+c])&255u)<<(8*c);
+        qnext[pixel*8+group]=word;
+    }
+}
+

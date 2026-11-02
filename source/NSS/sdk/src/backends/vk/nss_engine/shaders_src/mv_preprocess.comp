@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+// SPDX-License-Identifier: MIT
+
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_GOOGLE_include_directive : enable
+#if FFX_ARM_FRAMEINTERPOLATION_OPTION_SUPPORT_TENSOR
+#extension GL_ARM_tensors : require
+#endif
+
+                                                                               
+                      
+                                                                               
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FILLED_MOTION_TP1          0
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_WARP_FILLED_FLOW_TM1            1
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_PREVIOUS_INTERPOLATION_SOURCE   2
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_CURRENT_INTERPOLATION_SOURCE    3
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPUT_DEPTH_TP1                 4
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPUT_DEPTH_TM1                 5
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPUT_HOLES_TP1                 6
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_SRV_INPUT_HOLES_TM1                 7
+
+                                                                               
+                       
+                                                                               
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_UAV_IN_TENSOR                       8
+
+#define FFX_ARM_FRAMEINTERPOLATION_BIND_CB_FRAMEINTERPOLATION               9
+
+
+#include "frameinterpolation/ffx_frameinterpolation_callbacks_glsl.h"
+layout(std430,binding=10) buffer MvFeatures { float features[]; };
+layout(std430,binding=11) readonly buffer MvResidual { float residuals[]; };
+layout(binding=12) uniform texture2D mvOriginalMotion;
+layout(push_constant) uniform MvPC { uint width,height,cin,cout,wo,bo,act,skip; float radius; } m;
+layout(constant_id=10) const uint MV_MODE=0;
+                                                                                    
+                                                                                 
+vec4 mvTexel(texture2D im,ivec2 p,bool colour) {
+ ivec2 n=textureSize(im,0); if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,n)))return vec4(0);
+ vec4 v=texelFetch(im,p,0);
+ if(colour){v.rgb=max(v.rgb,vec3(0));v.rgb/=1.0+max(v.r,max(v.g,v.b));}return v;
+}
+vec4 mvSample(texture2D im,vec2 uv,bool colour) {
+ vec2 p=uv*vec2(textureSize(im,0))-.5;ivec2 q=ivec2(floor(p));vec2 f=fract(p);
+ return mix(mix(mvTexel(im,q,colour),mvTexel(im,q+ivec2(1,0),colour),f.x),
+            mix(mvTexel(im,q+ivec2(0,1),colour),mvTexel(im,q+ivec2(1,1),colour),f.x),f.y);
+}
+bool mvInside(vec2 u){return all(greaterThanEqual(u,vec2(0)))&&all(lessThanEqual(u,vec2(1)));}
+FFX_MIN16_F2 SingleTapCalculateDisocclusionMask(float d0,float d1,float2 a,float2 b);
+void mvBase(vec2 uv,out vec2 a,out vec2 b,out vec3 c0,out vec3 c1,out float d0,out float d1,out vec2 valid,out vec2 occ) {
+ ivec2 n=MvDepthLaneSize(), p=clamp(ivec2(uv*vec2(n)),ivec2(0),n-1);
+ vec2 v=vec2(LoadWarpedFilledMotionTP1(p));float t=Timestep();
+ a=uv+v*t;b=uv-v*(1-t);
+ c0=mvSample(r_previous_interpolation_source,a,true).rgb;c1=mvSample(r_current_interpolation_source,b,true).rgb;
+ d0=mvSample(r_depth_tm1,a,false).r;d1=mvSample(r_depth_tp1,b,false).r;
+ valid=vec2(mvInside(a),mvInside(b));
+ occ=vec2(SingleTapCalculateDisocclusionMask(d0,d1,a,b));
+ float holes=LoadInputHolesTp1(p);if(holes==0.0)valid=vec2(0);
+#if FFX_ARM_FRAMEINTERPOLATION_OPTION_INVERTED_DEPTH
+ d0=1-d0;d1=1-d1;
+#endif
+}
+vec4 mvResidualAt(vec2 uv) {
+ if(MV_MODE!=0)return vec4(0);
+ vec2 p=uv*vec2(m.width,m.height)-.5;ivec2 q=ivec2(floor(p));vec2 f=fract(p);vec4 result=vec4(0);
+ for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+  ivec2 s=clamp(q+ivec2(x,y),ivec2(0),ivec2(m.width-1,m.height-1));uint i=(uint(s.y)*m.width+uint(s.x))*4;
+  result+=vec4(residuals[i],residuals[i+1],residuals[i+2],residuals[i+3])*(x==0?1-f.x:f.x)*(y==0?1-f.y:f.y);
+ }
+ vec2 a,b,v,o;vec3 c0,c1;float d0,d1;mvBase(uv,a,b,c0,c1,d0,d1,v,o);
+ if(any(isnan(result))||any(isinf(result))||any(isnan(o))||any(isinf(o)))return vec4(0);
+ return clamp(result,vec4(-1),vec4(1))*vec4(vec2(v.x*(1-o.x)),vec2(v.y*(1-o.y)))/vec4(m.width,m.height,m.width,m.height);
+}
+
+#include "mv_preprocess_core.h"
+float mvDifference(vec2 uv){vec2 a,b,v,o;vec3 c0,c1;float d0,d1;mvBase(uv,a,b,c0,c1,d0,d1,v,o);return dot(abs(c0-c1),vec3(1.0/3.0));}
+layout(local_size_x=8,local_size_y=8) in;
+void main(){
+ ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+ if(MV_MODE==0){preprocess(p);return;}
+ if(p.x>=int(m.width)||p.y>=int(m.height))return;
+ vec2 size=vec2(m.width,m.height),uv=(vec2(p)+.5)/size;
+ vec2 a,b,v,o;vec3 c0,c1;float d0,d1;mvBase(uv,a,b,c0,c1,d0,d1,v,o);
+ vec2 motion=(a-b);                                                                       
+ vec2 endpointMotion=mvSample(mvOriginalMotion,b,false).xy*vec2(MotionVectorScale());
+ float error=length(motion-endpointMotion)*float(m.width);
+ float diff=dot(abs(c0-c1),vec3(1.0/3.0));
+ float gx=p.x+1<int(m.width)?abs(mvDifference(uv+vec2(1.0/m.width,0))-diff):0;
+ float gy=p.y+1<int(m.height)?abs(mvDifference(uv+vec2(0,1.0/m.height))-diff):0;
+ float values[24]=float[24](c0.r,c0.g,c0.b,c1.r,c1.g,c1.b,c0.r-c1.r,c0.g-c1.g,c0.b-c1.b,
+ (a.x-uv.x)*size.x,(a.y-uv.y)*size.y,(b.x-uv.x)*size.x,(b.y-uv.y)*size.y,
+ d0,d1,d0-d1,v.x,v.y,o.x,o.y,error,error,Timestep(),gx+gy);
+ uint i=(uint(p.y)*m.width+uint(p.x))*24;
+ for(uint c=0;c<24;c++)features[i+c]=(isnan(values[c])||isinf(values[c]))?0:values[c];
+}

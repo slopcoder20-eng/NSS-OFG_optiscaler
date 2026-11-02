@@ -1,0 +1,201 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_integer_dot_product : require
+#extension GL_GOOGLE_include_directive : enable
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#define ACC4(acc, a, b) acc = dotPacked4x8AccSatEXT(int(a), int(b), acc)
+
+                                                                       
+                                                                                            
+uint packTap4(const in Seg s, uint srow, int yy, int xx, uint c0, float qs, float sc_qs) {
+    bool in_ = xx >= 0 && yy >= 0 && xx < int(s.t.w) && yy < int(s.t.h);
+    int cy = clamp(yy, 0, int(s.t.h) - 1);
+    int cx = clamp(xx, 0, int(s.t.w) - 1);
+    vec4 v;
+    if (s.t.fmt == 1u) {
+        uint addr = s.t.base + (((srow * s.t.h + uint(cy)) * s.t.w + uint(cx)) * s.t.c_alloc + s.c_off + c0) * 2u;
+        uvec2 w = ldv2(addr >> 3u);
+        v = in_ ? (vec4(unpackHalf2x16(w.x), unpackHalf2x16(w.y)) * qs) : vec4(0.0);
+    } else if (s.t.fmt == 2u) {
+        uint addr = s.t.base + ((srow * s.t.h + uint(cy)) * s.t.w + uint(cx)) * s.t.c_alloc + s.c_off + c0;
+        int w = int(arena_u32[addr >> 2u]);
+        vec4 codes = vec4(
+            float(bitfieldExtract(w, 0, 8)),
+            float(bitfieldExtract(w, 8, 8)),
+            float(bitfieldExtract(w, 16, 8)),
+            float(bitfieldExtract(w, 24, 8))
+        );
+        v = in_ ? (codes * sc_qs) : vec4(0.0);
+    } else {
+        v = in_ ? (segRead4(s, srow, cy, cx, c0) * qs) : vec4(0.0);
+    }
+    ivec4 q = ivec4(clamp(roundEven(v), -127.0, 127.0));
+    return (uint(q.x) & 0xFFu) | ((uint(q.y) & 0xFFu) << 8u) |
+           ((uint(q.z) & 0xFFu) << 16u) | ((uint(q.w) & 0xFFu) << 24u);
+}
+
+uvec4 transpose4x4(uint t0, uint t1, uint t2, uint t3) {
+    uvec4 r;
+    r.x = (t0 & 0xFFu) | ((t1 & 0xFFu) << 8u) | ((t2 & 0xFFu) << 16u) | ((t3 & 0xFFu) << 24u);
+    r.y = ((t0 >> 8u) & 0xFFu) | (t1 & 0xFF00u) | ((t2 & 0xFF00u) << 8u) | ((t3 & 0xFF00u) << 16u);
+    r.z = ((t0 >> 16u) & 0xFFu) | ((t1 >> 8u) & 0xFF00u) | (t2 & 0xFF0000u) | ((t3 & 0xFF0000u) << 8u);
+    r.w = (t0 >> 24u) | ((t1 >> 16u) & 0xFF00u) | ((t2 >> 8u) & 0xFF0000u) | (t3 & 0xFF000000u);
+    return r;
+}
+
+void main() {
+    Tensor t = outAt();
+    Seg s = segAt(0u);
+    uint c4n = t.c >> 2u;
+    uint gid = gl_GlobalInvocationID.x;
+    uint c0 = (gid % c4n) * 4u;
+    uint pair_idx = gid / c4n;
+    uint w2 = (t.w + 1u) >> 1u;
+    uint hw2 = t.h * w2;
+    if (pair_idx >= t.n * hw2) return;
+
+    uint row = pair_idx / hw2;
+    uint q = pair_idx - row * hw2;
+    int y = int(q / w2);
+    int x0 = int((q % w2) * 2u);
+    int x1 = x0 + 1;
+    bool has1 = (uint(x1) < t.w);
+
+    uint srow = srcRow(s, row);
+    int st = opi(2), pd = opi(3), dl = opi(4);
+    float qs = opf(0u);
+    float sc_qs = s.t.scale * qs;
+
+    uint w_off = opw(OP_W_OFF);
+    uint kw_words = opw(OP_KW_WORDS);
+    uint so = opw(OP_SCALE_OFF) + c0;
+    uint bo = opw(OP_BIAS_OFF) + c0;
+
+                                                                                   
+    uint wb0 = w_off + (c0 + 0u) * kw_words;
+    uint wb1 = w_off + (c0 + 1u) * kw_words;
+    uint wb2 = w_off + (c0 + 2u) * kw_words;
+    uint wb3 = w_off + (c0 + 3u) * kw_words;
+
+    uvec3 w_c0 = uvec3(blob[wb0 + 0u], blob[wb0 + 1u], blob[wb0 + 2u]);
+    uvec3 w_c1 = uvec3(blob[wb1 + 0u], blob[wb1 + 1u], blob[wb1 + 2u]);
+    uvec3 w_c2 = uvec3(blob[wb2 + 0u], blob[wb2 + 1u], blob[wb2 + 2u]);
+    uvec3 w_c3 = uvec3(blob[wb3 + 0u], blob[wb3 + 1u], blob[wb3 + 2u]);
+
+    vec4 sc = uintBitsToFloat(uvec4(blob[so + 0u], blob[so + 1u], blob[so + 2u], blob[so + 3u]));
+    vec4 bi = uintBitsToFloat(uvec4(blob[bo + 0u], blob[bo + 1u], blob[bo + 2u], blob[bo + 3u]));
+
+    uvec4 pk0_0, pk0_1, pk0_2;
+    uvec4 pk1_0, pk1_1, pk1_2;
+
+    int iy0 = y * st - pd;
+    int ix0 = x0 * st - pd;
+
+    if (st == 1 && dl == 1) {
+                                                                                                    
+        uint r0_0 = packTap4(s, srow, iy0 + 0, ix0 + 0, c0, qs, sc_qs);
+        uint r0_1 = packTap4(s, srow, iy0 + 0, ix0 + 1, c0, qs, sc_qs);
+        uint r0_2 = packTap4(s, srow, iy0 + 0, ix0 + 2, c0, qs, sc_qs);
+        uint r0_3 = has1 ? packTap4(s, srow, iy0 + 0, ix0 + 3, c0, qs, sc_qs) : 0u;
+
+        uint r1_0 = packTap4(s, srow, iy0 + 1, ix0 + 0, c0, qs, sc_qs);
+        uint r1_1 = packTap4(s, srow, iy0 + 1, ix0 + 1, c0, qs, sc_qs);
+        uint r1_2 = packTap4(s, srow, iy0 + 1, ix0 + 2, c0, qs, sc_qs);
+        uint r1_3 = has1 ? packTap4(s, srow, iy0 + 1, ix0 + 3, c0, qs, sc_qs) : 0u;
+
+        uint r2_0 = packTap4(s, srow, iy0 + 2, ix0 + 0, c0, qs, sc_qs);
+        uint r2_1 = packTap4(s, srow, iy0 + 2, ix0 + 1, c0, qs, sc_qs);
+        uint r2_2 = packTap4(s, srow, iy0 + 2, ix0 + 2, c0, qs, sc_qs);
+        uint r2_3 = has1 ? packTap4(s, srow, iy0 + 2, ix0 + 3, c0, qs, sc_qs) : 0u;
+
+        pk0_0 = transpose4x4(r0_0, r0_1, r0_2, r1_0);
+        pk0_1 = transpose4x4(r1_1, r1_2, r2_0, r2_1);
+        pk0_2 = transpose4x4(r2_2, 0u,   0u,   0u);
+
+        pk1_0 = transpose4x4(r0_1, r0_2, r0_3, r1_1);
+        pk1_1 = transpose4x4(r1_2, r1_3, r2_1, r2_2);
+        pk1_2 = transpose4x4(r2_3, 0u,   0u,   0u);
+    } else if (st == 2 && dl == 1) {
+                                                                                                                      
+        uint r0_0 = packTap4(s, srow, iy0 + 0, ix0 + 0, c0, qs, sc_qs);
+        uint r0_1 = packTap4(s, srow, iy0 + 0, ix0 + 1, c0, qs, sc_qs);
+        uint r0_2 = packTap4(s, srow, iy0 + 0, ix0 + 2, c0, qs, sc_qs);
+        uint r0_3 = has1 ? packTap4(s, srow, iy0 + 0, ix0 + 3, c0, qs, sc_qs) : 0u;
+        uint r0_4 = has1 ? packTap4(s, srow, iy0 + 0, ix0 + 4, c0, qs, sc_qs) : 0u;
+
+        uint r1_0 = packTap4(s, srow, iy0 + 1, ix0 + 0, c0, qs, sc_qs);
+        uint r1_1 = packTap4(s, srow, iy0 + 1, ix0 + 1, c0, qs, sc_qs);
+        uint r1_2 = packTap4(s, srow, iy0 + 1, ix0 + 2, c0, qs, sc_qs);
+        uint r1_3 = has1 ? packTap4(s, srow, iy0 + 1, ix0 + 3, c0, qs, sc_qs) : 0u;
+        uint r1_4 = has1 ? packTap4(s, srow, iy0 + 1, ix0 + 4, c0, qs, sc_qs) : 0u;
+
+        uint r2_0 = packTap4(s, srow, iy0 + 2, ix0 + 0, c0, qs, sc_qs);
+        uint r2_1 = packTap4(s, srow, iy0 + 2, ix0 + 1, c0, qs, sc_qs);
+        uint r2_2 = packTap4(s, srow, iy0 + 2, ix0 + 2, c0, qs, sc_qs);
+        uint r2_3 = has1 ? packTap4(s, srow, iy0 + 2, ix0 + 3, c0, qs, sc_qs) : 0u;
+        uint r2_4 = has1 ? packTap4(s, srow, iy0 + 2, ix0 + 4, c0, qs, sc_qs) : 0u;
+
+        pk0_0 = transpose4x4(r0_0, r0_1, r0_2, r1_0);
+        pk0_1 = transpose4x4(r1_1, r1_2, r2_0, r2_1);
+        pk0_2 = transpose4x4(r2_2, 0u,   0u,   0u);
+
+        pk1_0 = transpose4x4(r0_2, r0_3, r0_4, r1_2);
+        pk1_1 = transpose4x4(r1_3, r1_4, r2_2, r2_3);
+        pk1_2 = transpose4x4(r2_4, 0u,   0u,   0u);
+    } else {
+                                                                                          
+        int ix1 = x1 * st - pd;
+        uint t0_0 = packTap4(s, srow, iy0 + 0 * dl, ix0 + 0 * dl, c0, qs, sc_qs);
+        uint t0_1 = packTap4(s, srow, iy0 + 0 * dl, ix0 + 1 * dl, c0, qs, sc_qs);
+        uint t0_2 = packTap4(s, srow, iy0 + 0 * dl, ix0 + 2 * dl, c0, qs, sc_qs);
+        uint t0_3 = packTap4(s, srow, iy0 + 1 * dl, ix0 + 0 * dl, c0, qs, sc_qs);
+        pk0_0 = transpose4x4(t0_0, t0_1, t0_2, t0_3);
+
+        uint t0_4 = packTap4(s, srow, iy0 + 1 * dl, ix0 + 1 * dl, c0, qs, sc_qs);
+        uint t0_5 = packTap4(s, srow, iy0 + 1 * dl, ix0 + 2 * dl, c0, qs, sc_qs);
+        uint t0_6 = packTap4(s, srow, iy0 + 2 * dl, ix0 + 0 * dl, c0, qs, sc_qs);
+        uint t0_7 = packTap4(s, srow, iy0 + 2 * dl, ix0 + 1 * dl, c0, qs, sc_qs);
+        pk0_1 = transpose4x4(t0_4, t0_5, t0_6, t0_7);
+
+        uint t0_8 = packTap4(s, srow, iy0 + 2 * dl, ix0 + 2 * dl, c0, qs, sc_qs);
+        pk0_2 = transpose4x4(t0_8, 0u, 0u, 0u);
+
+        if (has1) {
+            uint t1_0 = packTap4(s, srow, iy0 + 0 * dl, ix1 + 0 * dl, c0, qs, sc_qs);
+            uint t1_1 = packTap4(s, srow, iy0 + 0 * dl, ix1 + 1 * dl, c0, qs, sc_qs);
+            uint t1_2 = packTap4(s, srow, iy0 + 0 * dl, ix1 + 2 * dl, c0, qs, sc_qs);
+            uint t1_3 = packTap4(s, srow, iy0 + 1 * dl, ix1 + 0 * dl, c0, qs, sc_qs);
+            pk1_0 = transpose4x4(t1_0, t1_1, t1_2, t1_3);
+
+            uint t1_4 = packTap4(s, srow, iy0 + 1 * dl, ix1 + 1 * dl, c0, qs, sc_qs);
+            uint t1_5 = packTap4(s, srow, iy0 + 1 * dl, ix1 + 2 * dl, c0, qs, sc_qs);
+            uint t1_6 = packTap4(s, srow, iy0 + 2 * dl, ix1 + 0 * dl, c0, qs, sc_qs);
+            uint t1_7 = packTap4(s, srow, iy0 + 2 * dl, ix1 + 1 * dl, c0, qs, sc_qs);
+            pk1_1 = transpose4x4(t1_4, t1_5, t1_6, t1_7);
+
+            uint t1_8 = packTap4(s, srow, iy0 + 2 * dl, ix1 + 2 * dl, c0, qs, sc_qs);
+            pk1_2 = transpose4x4(t1_8, 0u, 0u, 0u);
+        }
+    }
+
+    ivec4 acc0 = ivec4(0);
+    ACC4(acc0.x, pk0_0.x, w_c0.x); ACC4(acc0.x, pk0_1.x, w_c0.y); ACC4(acc0.x, pk0_2.x, w_c0.z);
+    ACC4(acc0.y, pk0_0.y, w_c1.x); ACC4(acc0.y, pk0_1.y, w_c1.y); ACC4(acc0.y, pk0_2.y, w_c1.z);
+    ACC4(acc0.z, pk0_0.z, w_c2.x); ACC4(acc0.z, pk0_1.z, w_c2.y); ACC4(acc0.z, pk0_2.z, w_c2.z);
+    ACC4(acc0.w, pk0_0.w, w_c3.x); ACC4(acc0.w, pk0_1.w, w_c3.y); ACC4(acc0.w, pk0_2.w, w_c3.z);
+    vec4 o0 = vec4(acc0) * sc + bi;
+    tensorWrite4(t, row, y, x0, c0, o0);
+
+    if (has1) {
+        ivec4 acc1 = ivec4(0);
+        ACC4(acc1.x, pk1_0.x, w_c0.x); ACC4(acc1.x, pk1_1.x, w_c0.y); ACC4(acc1.x, pk1_2.x, w_c0.z);
+        ACC4(acc1.y, pk1_0.y, w_c1.x); ACC4(acc1.y, pk1_1.y, w_c1.y); ACC4(acc1.y, pk1_2.y, w_c1.z);
+        ACC4(acc1.z, pk1_0.z, w_c2.x); ACC4(acc1.z, pk1_1.z, w_c2.y); ACC4(acc1.z, pk1_2.z, w_c2.z);
+        ACC4(acc1.w, pk1_0.w, w_c3.x); ACC4(acc1.w, pk1_1.w, w_c3.y); ACC4(acc1.w, pk1_2.w, w_c3.z);
+        vec4 o1 = vec4(acc1) * sc + bi;
+        tensorWrite4(t, row, y, x1, c0, o1);
+    }
+}

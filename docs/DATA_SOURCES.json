@@ -1,0 +1,125 @@
+[
+  {
+    "capture_set": "forest_x1_5",
+    "project_name": "ElectricDreamsEnv.uproject",
+    "requested_frames": 3000,
+    "input_resolution": [
+      1280,
+      720
+    ],
+    "ground_truth": [
+      1920,
+      1080
+    ],
+    "fps": 60,
+    "maps": [
+      "/Game/Levels/ElectricDreams_Env",
+      "/Game/Levels/PCG/Breakdown_Levels/ElectricDreams_PCGForest",
+      "/Game/Levels/PCG/ElectricDreams_PCGCloseRange"
+    ],
+    "seed": 20261004
+  },
+  {
+    "capture_set": "forest_x1_7",
+    "project_name": "ElectricDreamsEnv.uproject",
+    "requested_frames": 1500,
+    "input_resolution": [
+      1129,
+      635
+    ],
+    "ground_truth": [
+      1920,
+      1080
+    ],
+    "fps": 60,
+    "maps": [
+      "/Game/Levels/ElectricDreams_Env",
+      "/Game/Levels/PCG/Breakdown_Levels/ElectricDreams_PCGForest",
+      "/Game/Levels/PCG/ElectricDreams_PCGCloseRange"
+    ],
+    "seed": 20261004
+  },
+  {
+    "capture_set": "forest_x2",
+    "project_name": "ElectricDreamsEnv.uproject",
+    "requested_frames": 2500,
+    "input_resolution": [
+      960,
+      540
+    ],
+    "ground_truth": [
+      1920,
+      1080
+    ],
+    "fps": 60,
+    "maps": [
+      "/Game/Levels/ElectricDreams_Env",
+      "/Game/Levels/PCG/Breakdown_Levels/ElectricDreams_PCGForest",
+      "/Game/Levels/PCG/ElectricDreams_PCGCloseRange"
+    ],
+    "seed": 20261004
+  },
+  {
+    "capture_set": "lyra_x1_5",
+    "project_name": "LyraStarterGame.uproject",
+    "requested_frames": 1500,
+    "input_resolution": [
+      1280,
+      720
+    ],
+    "ground_truth": [
+      1920,
+      1080
+    ],
+    "fps": 60,
+    "maps": [
+      "/ShooterMaps/Maps/L_Expanse",
+      "/ShooterMaps/Maps/L_FiringRange_WP",
+      "/ShooterMaps/Maps/L_ShooterFrontendBackground",
+      "/TopDownArena/Maps/L_TopDownArenaGym"
+    ],
+    "seed": 20261002
+  },
+  {
+    "capture_set": "lyra_x1_7",
+    "project_name": "LyraStarterGame.uproject",
+    "requested_frames": 1500,
+    "input_resolution": [
+      1129,
+      635
+    ],
+    "ground_truth": [
+      1920,
+      1080
+    ],
+    "fps": 60,
+    "maps": [
+      "/ShooterMaps/Maps/L_Expanse",
+      "/ShooterMaps/Maps/L_FiringRange_WP",
+      "/ShooterMaps/Maps/L_ShooterFrontendBackground",
+      "/TopDownArena/Maps/L_TopDownArenaGym"
+    ],
+    "seed": 20261002
+  },
+  {
+    "capture_set": "lyra_x2",
+    "project_name": "LyraStarterGame.uproject",
+    "requested_frames": 1500,
+    "input_resolution": [
+      960,
+      540
+    ],
+    "ground_truth": [
+      1920,
+      1080
+    ],
+    "fps": 60,
+    "maps": [
+      "/ShooterMaps/Maps/L_Expanse",
+      "/ShooterMaps/Maps/L_FiringRange_WP",
+      "/ShooterMaps/Maps/L_ShooterFrontendBackground",
+      "/TopDownArena/Maps/L_TopDownArenaGym"
+    ],
+    "seed": 20261002
+  }
+]

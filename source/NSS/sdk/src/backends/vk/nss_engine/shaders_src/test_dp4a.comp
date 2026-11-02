@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) buffer Buf {
+    int out_val;
+    uint in_a;
+    uint in_b;
+};
+
+int dp4a(uint a, uint b) {
+    i8vec4 va = i8vec4(unpack8(a));
+    i8vec4 vb = i8vec4(unpack8(b));
+    return int(va.x)*int(vb.x) + int(va.y)*int(vb.y) + int(va.z)*int(vb.z) + int(va.w)*int(vb.w);
+}
+
+void main() {
+    out_val = dp4a(in_a, in_b);
+}

@@ -1,0 +1,113 @@
+#version 450
+#ifdef NFRU_DX12
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
+#extension GL_EXT_integer_dot_product : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+
+                                                                                                    
+                                                                                                         
+                                                                                                                     
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_width;                                                                                          
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint in_channels;                   
+    uint out_channels;
+    int  pad_t;
+    int  pad_l;
+    int  stride_y;
+    int  stride_x;
+    uint kh;
+    uint kw;
+    int  out_zp;
+    int  mult;
+    int  shift;                
+    uint upsample;                                                                                        
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer   { uvec4 in_data[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer { uint out_data[]; };
+layout(std430, set = 0, binding = 2) readonly buffer WeightBuffer  { uint weight_data[]; };
+layout(std430, set = 0, binding = 3) readonly buffer BiasBuffer    { int32_t bias_data[]; };
+
+#define OCT 2
+#define NOC (16 * OCT)
+#define DP4A(a, b) dotPacked4x8EXT(int(a), int(b))
+
+void main() {
+    const uint p = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    const bool ok = p < pc.out_width * pc.out_height;
+    const uint oy = ok ? (p / pc.out_width) : 0u;
+    const uint ox = ok ? (p % pc.out_width) : 0u;
+
+    const uint ic_tiles = pc.in_channels / 16u;
+    const uint oc_tiles = (pc.out_channels + 15u) / 16u;
+    const uint oc_base  = gl_WorkGroupID.y * NOC;
+    const uint nOc      = min(pc.out_channels - oc_base, uint(NOC));
+
+                                                                                                   
+                                                                                                   
+                                                                                                    
+                                                                                                     
+                                                                                                    
+                                                                                                
+                                                                                               
+    int32_t acc[NOC];
+    for (uint o = 0; o < NOC; ++o) acc[o] = 0;
+
+    for (uint ky = 0u; ky < pc.kh; ++ky) {
+        const int iy = int(oy) * pc.stride_y + int(ky) - pc.pad_t;
+        for (uint kx = 0u; kx < pc.kw; ++kx) {
+            const int ix = int(ox) * pc.stride_x + int(kx) - pc.pad_l;
+            const bool inb = ok && (iy >= 0) && (iy < int(pc.in_height)) && (ix >= 0) && (ix < int(pc.in_width));
+            uint p_in = 0u;
+            if (inb)
+                p_in = (pc.upsample != 0u) ? ((uint(iy) >> 1) * (pc.in_width >> 1) + (uint(ix) >> 1))
+                                           : (uint(iy) * pc.in_width + uint(ix));
+            for (uint ic_t = 0u; ic_t < ic_tiles; ++ic_t) {
+                uvec4 v = uvec4(0x80808080u);
+                if (inb) v = in_data[p_in * ic_tiles + ic_t];
+
+                const uint wtile = (((ky * pc.kw + kx) * ic_tiles + ic_t) * oc_tiles + oc_base / 16u) * 64u;
+                [[unroll]] for (uint o = 0; o < NOC; ++o) {
+                    if (o >= nOc) break;
+                    const uint wb = wtile + (o >> 4) * 64u + (o & 15u);
+                    acc[o] += DP4A(v.x, weight_data[wb])
+                            + DP4A(v.y, weight_data[wb + 16u])
+                            + DP4A(v.z, weight_data[wb + 32u])
+                            + DP4A(v.w, weight_data[wb + 48u]);
+                }
+            }
+        }
+    }
+
+    if (!ok) return;
+
+                                                                                                         
+    const uint words_per_pixel = pc.out_channels / 4u;
+    [[unroll]] for (uint w = 0; w < NOC / 4u; ++w) {
+        if (w * 4u >= nOc) break;
+        uint packed_word = 0u;
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            const uint o = w * 4u + j;
+            if (o >= nOc) break;
+            const int32_t a = acc[o] + bias_data[oc_base + o];
+            int32_t hi, lo;
+            #ifdef NFRU_DX12
+            { const int64_t prod = int64_t(a) * int64_t(pc.mult); hi = int32_t(prod >> 32); lo = int32_t(prod); }                              
+#else
+            imulExtended(a, pc.mult, hi, lo);
+#endif
+            const int32_t val = ((hi + (1 << (pc.shift - 33))) >> (pc.shift - 32)) + pc.out_zp;
+            packed_word |= (uint(clamp(val, -128, 127)) & 0xFFu) << (8u * j);
+        }
+        out_data[p * words_per_pixel + oc_base / 4u + w] = packed_word;
+    }
+}

@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+                                                                  
+                                                             
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                                    
+    uint npix = to.w * to.h;
+    if (gid >= npix) return;
+
+    int oy = int(gid / to.w);
+    int ox = int(gid - uint(oy) * to.w);
+
+    Seg s_ab = segAt(0u);                         
+    Seg s_ba = segAt(1u);                         
+
+    vec2 fab = segRead2(s_ab, 0u, oy, ox, 0u);
+    vec2 fba = segRead2(s_ba, 0u, oy, ox, 0u);
+
+    float t = fcf(FC_T);
+    vec2 f_ta = -(1.0 - t) * t * fab + (t * t) * fba;
+    vec2 f_tb = ((1.0 - t) * (1.0 - t)) * fab - t * (1.0 - t) * fba;
+
+                           
+    uint addr_ta = (to.base >> 2u) + uint(oy) * to.w + uint(ox);
+    arena_u32[addr_ta] = packHalf2x16(f_ta);
+
+                                            
+    Tensor to_b = tensorAt(opw(OP_IP));
+    uint addr_tb = (to_b.base >> 2u) + uint(oy) * to_b.w + uint(ox);
+    arena_u32[addr_tb] = packHalf2x16(f_tb);
+
+                                                  
+    Tensor to_m = tensorAt(opw(OP_IP + 1u));
+    uint addr_tm = (to_m.base >> 2u) + uint(oy) * to_m.w + uint(ox);
+    arena_u32[addr_tm] = 0u;
+}

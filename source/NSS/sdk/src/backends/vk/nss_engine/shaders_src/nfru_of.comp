@@ -1,0 +1,347 @@
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_control_flow_attributes : enable
+
+                                                                                                                      
+                                                                                                                      
+                                                                                                               
+                                                                                                  
+  
+                                                                                              
+                                                                                                          
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(constant_id = 0) const bool adaptiveFallback = false;
+                                                                                                                         
+                                                                                                        
+layout(constant_id = 1) const bool exitCameraFlow = false;
+
+layout(set = 0, binding = 0) uniform texture2D r_color_tp1;
+layout(set = 0, binding = 1) uniform texture2D r_color_tm1;
+layout(set = 0, binding = 2) uniform texture2D r_hint;
+layout(set = 0, binding = 3, rg16f) uniform image2D rw_flow;                                               
+
+layout(set = 0, binding = 4) uniform texture2D r_game_mv;
+
+layout(set=0,binding=5) uniform texture2D r_depth;
+
+layout(set=0,binding=7) uniform texture2D r_previous_depth;
+
+layout(set=0,binding=6,std430) buffer OfDiag{uint count[];} diag;
+layout(push_constant) uniform PC {
+    int   mode;
+    int   radius;
+    float seedSignX;                                     
+    float seedSignY;
+    float flowSignX;                               
+    float flowSignY;
+    float constX;                                                                   
+    float constY;
+    vec2 mvUvScale;
+    int useGameMv;
+    int useDepth;
+    mat4 previousToCurrentClip;
+} pc;
+
+float luma(vec4 c) { return dot(c.rgb, vec3(0.299, 0.587, 0.114)); }
+                                                                                                                           
+int g_rejReason = 0;
+bool rejectWith(int r) { if (g_rejReason == 0) g_rejReason = r; return false; }
+
+                                                                             
+vec2 backwardMv(vec2 uv, bool depthAware) {
+    ivec2 d = textureSize(r_game_mv, 0);
+    vec2 p = uv * vec2(d) - 0.5;
+    ivec2 q = ivec2(floor(p)); vec2 t = fract(p);
+    vec2 a = texelFetch(r_game_mv, clamp(q, ivec2(0), d-1), 0).xy;
+    vec2 b = texelFetch(r_game_mv, clamp(q+ivec2(1,0), ivec2(0), d-1), 0).xy;
+    vec2 c = texelFetch(r_game_mv, clamp(q+ivec2(0,1), ivec2(0), d-1), 0).xy;
+    vec2 e = texelFetch(r_game_mv, clamp(q+ivec2(1,1), ivec2(0), d-1), 0).xy;
+    vec2 value=mix(mix(a,b,t.x),mix(c,e,t.x),t.y);
+    if (!depthAware || (pc.useDepth & 1) == 0) return value * pc.mvUvScale;
+    vec2 mvs[4]=vec2[4](a,b,c,e);
+    ivec2 offsets[4]=ivec2[4](ivec2(0),ivec2(1,0),ivec2(0,1),ivec2(1));
+    float weights[4]=float[4]((1-t.x)*(1-t.y),t.x*(1-t.y),(1-t.x)*t.y,t.x*t.y);
+    int nearest=(t.x>=0.5?1:0)+(t.y>=0.5?2:0);
+    vec2 imageDim=vec2(textureSize(r_color_tp1,0));
+    float spread=0.0;
+    for(int i=0;i<4;i++)spread=max(spread,length((mvs[i]-mvs[nearest])*pc.mvUvScale*imageDim));
+    if(depthAware && spread>0.5){
+        ivec2 dd=textureSize(r_depth,0);
+        float z[4];
+        for(int i=0;i<4;i++){
+            vec2 tapUv=(vec2(clamp(q+offsets[i],ivec2(0),d-1))+0.5)/vec2(d);
+            z[i]=texelFetch(r_depth,clamp(ivec2(tapUv*vec2(dd)),ivec2(0),dd-1),0).x;
+        }
+        float total=0.0;vec2 sum=vec2(0);
+        for(int i=0;i<4;i++){
+            float rel=abs(z[i]-z[nearest])/max(max(abs(z[i]),abs(z[nearest])),1e-6);
+            float weight=rel<=0.05?weights[i]:0.0;
+            sum+=mvs[i]*weight;total+=weight;
+        }
+        value=total>1e-6?sum/total:mvs[nearest];
+    }
+    return value * pc.mvUvScale;
+}
+float sampledLuma(texture2D image, vec2 uv) {
+    ivec2 d = textureSize(image, 0);
+    vec2 p = uv * vec2(d) - 0.5; ivec2 q = ivec2(floor(p)); vec2 t = fract(p);
+    float a = luma(texelFetch(image, clamp(q,ivec2(0),d-1),0));
+    float b = luma(texelFetch(image, clamp(q+ivec2(1,0),ivec2(0),d-1),0));
+    float c = luma(texelFetch(image, clamp(q+ivec2(0,1),ivec2(0),d-1),0));
+    float e = luma(texelFetch(image, clamp(q+ivec2(1,1),ivec2(0),d-1),0));
+    return mix(mix(a,b,t.x),mix(c,e,t.x),t.y);
+}
+                                                                       
+                                                                           
+                                                                                
+bool solveInverseGameMv(vec2 prevUv, vec2 cameraHint, out vec2 forwardUv, bool depthAware) {
+    vec2 cur = prevUv + cameraHint;
+    ivec2 mvDim = textureSize(r_game_mv,0);
+    for (int i=0;i<6;++i) {
+        if (any(lessThan(cur,vec2(0))) || any(greaterThanEqual(cur,vec2(1)))) return rejectWith(1);
+        vec2 b = backwardMv(cur, depthAware);
+        if (any(isnan(b)) || any(isinf(b))) return rejectWith(2);
+        cur = prevUv - b;
+    }
+    if (any(lessThan(cur,vec2(0))) || any(greaterThanEqual(cur,vec2(1)))) return rejectWith(3);
+    vec2 residual = (cur + backwardMv(cur, depthAware) - prevUv) * vec2(mvDim);
+    if (length(residual)>0.5) return rejectWith(4);
+    float prevLuma=sampledLuma(r_color_tm1, prevUv);
+    if (abs(prevLuma-sampledLuma(r_color_tp1, cur))>0.08) return rejectWith(5);
+    forwardUv=cur-prevUv;
+    return true;
+}
+
+                                                                                     
+                                                                                   
+float temporalDepthError(vec2 previousUv,vec2 currentUv) {
+    ivec2 pd=textureSize(r_previous_depth,0),cd=textureSize(r_depth,0);
+    float z=texelFetch(r_previous_depth,clamp(ivec2(previousUv*vec2(pd)),ivec2(0),pd-1),0).x;
+    vec4 clip=pc.previousToCurrentClip*vec4(2.0*vec2(previousUv.x,1.0-previousUv.y)-1.0,z,1.0);
+    if(any(isnan(clip))||any(isinf(clip))||clip.w<=1e-6)return -1.0;
+    float expected=clip.z/clip.w;
+    float actual=texelFetch(r_depth,clamp(ivec2(currentUv*vec2(cd)),ivec2(0),cd-1),0).x;
+    if(isnan(actual)||isinf(actual)||expected<0.0||expected>1.0)return -1.0;
+    return abs(actual-expected)/max(max(abs(actual),abs(expected)),0.001);
+}
+bool inverseGameMv(vec2 prevUv,vec2 cameraHint,out vec2 forwardUv,bool depthAware) {
+    vec2 cameraFlow;
+    bool cameraValid=solveInverseGameMv(prevUv,cameraHint,cameraFlow,depthAware);
+    bool temporal=(pc.useDepth&2)!=0;
+    if(cameraValid&&!temporal){forwardUv=cameraFlow;return true;}
+    vec2 gameSeed=-backwardMv(prevUv,depthAware);
+    if(any(isnan(gameSeed))||any(isinf(gameSeed))||length((gameSeed-cameraHint)*vec2(textureSize(r_game_mv,0)))<=0.25){
+        if(cameraValid)forwardUv=cameraFlow;return cameraValid;
+    }
+    vec2 localFlow;bool localValid=solveInverseGameMv(prevUv,gameSeed,localFlow,depthAware);
+    if(localValid&&!cameraValid){forwardUv=localFlow;return true;}
+    if(cameraValid&&localValid&&temporal){
+        float ce=temporalDepthError(prevUv,prevUv+cameraFlow),le=temporalDepthError(prevUv,prevUv+localFlow);
+        if(ce>0.05&&le>=0.0&&le+0.02<ce){forwardUv=localFlow;return true;}
+    }
+    if(cameraValid)forwardUv=cameraFlow;return cameraValid;
+}
+
+                                                                                                               
+                                                                                                                    
+bool nearStaticMv(vec2 uv, ivec2 colorDim) {
+    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+        vec2 m = backwardMv(uv + vec2(x, y) * 8.0 / vec2(colorDim), false);
+        if (!any(isnan(m)) && length(m * vec2(colorDim)) <= 0.25) return true;
+    }
+    return false;
+}
+
+                                                                                                    
+float correspondenceError(vec2 previousUv, vec2 flowUv) {
+    vec2 stepUv=1.0/vec2(textureSize(r_color_tp1,0));
+    float error=0.0;
+    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){
+        vec2 delta=vec2(x,y)*stepUv;
+        error+=abs(sampledLuma(r_color_tm1,previousUv+delta)-sampledLuma(r_color_tp1,previousUv+flowUv+delta));
+    }
+    return error/9.0;
+}
+
+void main() {
+    const ivec2 o        = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 flowDim  = imageSize(rw_flow);
+    if (any(greaterThanEqual(o, flowDim))) return;
+
+    const ivec2 hintDim  = textureSize(r_hint, 0);
+    const ivec2 colorDim = textureSize(r_color_tp1, 0);
+    const ivec2 hc       = min((o * hintDim) / flowDim, hintDim - 1);
+                                                                             
+    vec2 hint = texelFetch(r_hint,hc,0).xy / vec2(colorDim) * vec2(pc.seedSignX,pc.seedSignY);
+    const vec2 cameraHint = hint;
+                                                                            
+    if(pc.useGameMv!=0 && pc.mode!=2){
+        vec2 previousUv=(vec2(o)+0.5)/vec2(flowDim);
+        vec2 cameraTarget=previousUv+hint;
+        if(any(isnan(hint))||any(isinf(hint))||any(lessThan(cameraTarget,vec2(0)))||any(greaterThanEqual(cameraTarget,vec2(1)))){
+            vec2 gameSeed=-backwardMv(previousUv,false);
+            if(!any(isnan(gameSeed))&&!any(isinf(gameSeed)))hint=gameSeed;
+        }
+    }
+
+    vec2 flow = hint;
+
+    bool gameValid = false;
+    if (pc.useGameMv != 0 && pc.mode != 2) {
+        vec2 gameFlow;
+        vec2 previousUv=(vec2(o)+0.5)/vec2(flowDim);
+        gameValid = inverseGameMv(previousUv, hint, gameFlow, false);
+        if (gameValid) flow = gameFlow;
+        if ((pc.useDepth & 1) != 0) {
+        vec2 probeUv=gameValid?previousUv+gameFlow:previousUv+hint;
+        vec2 baselineMv=backwardMv(probeUv,false);
+        vec2 depthMv=backwardMv(probeUv,true);
+        if(length((baselineMv-depthMv)*vec2(colorDim))>0.25){
+            vec2 depthFlow;
+            bool depthValid=inverseGameMv(previousUv,hint,depthFlow,true);
+            if(depthValid && (!gameValid || correspondenceError(previousUv,depthFlow)+0.001<correspondenceError(previousUv,gameFlow))){
+                flow=depthFlow;gameValid=true;
+            }
+        }
+    }
+        }
+    bool exitCamera = false;
+    if (exitCameraFlow && !gameValid && pc.useGameMv != 0 && pc.mode != 2 && (g_rejReason == 1 || g_rejReason == 3)) {
+        vec2 target = (vec2(o)+0.5)/vec2(flowDim) + cameraHint;
+        if (!any(isnan(cameraHint)) && !any(isinf(cameraHint)) &&
+            (any(lessThan(target, vec2(0))) || any(greaterThanEqual(target, vec2(1))))) {
+            flow = cameraHint; gameValid = true; exitCamera = true;
+        }
+    }
+                                                                                   
+                                                                                       
+    if (adaptiveFallback && gameValid && length(hint*vec2(colorDim))>1.0
+        && (length(flow*vec2(colorDim))<=0.25 || nearStaticMv((vec2(o)+0.5)/vec2(flowDim), colorDim))) {
+        vec2 uv=(vec2(o)+0.5)/vec2(flowDim);
+        float error=0.0;
+        for(int y=-4;y<4;y+=2)for(int x=-4;x<4;x+=2){
+            vec2 delta=vec2(x,y)/vec2(colorDim);
+            error+=abs(sampledLuma(r_color_tm1,uv+delta)-sampledLuma(r_color_tp1,uv+flow+delta));
+        }
+        if(error/16.0>0.025)gameValid=false;
+    }
+    if((pc.useDepth & 256)!=0){
+        atomicAdd(diag.count[0],1u);
+        if(pc.useGameMv!=0){if(gameValid){atomicAdd(diag.count[1],1u);if(length(flow*vec2(colorDim))<=.25)atomicAdd(diag.count[2],1u);}else{atomicAdd(diag.count[3],1u);atomicAdd(diag.count[6+clamp(g_rejReason,0,5)],1u);
+                                                                                      
+            float m=length(backwardMv((vec2(o)+0.5)/vec2(flowDim),false)*vec2(colorDim));atomicAdd(diag.count[m<8.0?12:(m<32.0?13:14)],1u);}}
+        else atomicAdd(diag.count[5],1u);
+        if(exitCamera)atomicAdd(diag.count[15],1u);
+    }
+                                                                        
+                                                                                     
+                                                                                                                     
+                                                                                                                  
+                                                                                                                       
+    vec2 originalFlow = vec2(0.0);
+    const bool hybrid = !gameValid && (pc.useDepth & 512) != 0;
+    if (hybrid) originalFlow = imageLoad(rw_flow, o).xy / (vec2(colorDim) * vec2(pc.flowSignX, pc.flowSignY));
+    if (!gameValid && (pc.mode == 1 || pc.mode == 4 || (pc.useGameMv != 0 && pc.mode == 0))) {
+        const vec2  uv     = (vec2(o) + 0.5) / vec2(flowDim);
+        const ivec2 center = ivec2(uv * vec2(colorDim));
+                                                                                                                    
+                                                                                                                       
+                                                                                       
+        vec2 seedFlow = hint;
+        if (pc.useGameMv != 0) {
+            float bestErr = correspondenceError(uv, hint);
+            const vec2 local = -backwardMv(uv, false);
+            if (!any(isnan(local)) && !any(isinf(local))) {
+                const float e = correspondenceError(uv, local);
+                if (e < bestErr) { bestErr = e; seedFlow = local; }
+            }
+            if (correspondenceError(uv, vec2(0.0)) < bestErr) seedFlow = vec2(0.0);
+        }
+        const ivec2 seed   = ivec2(round(seedFlow * vec2(colorDim)));
+        bool allowExpansion = adaptiveFallback && (pc.useGameMv == 0 || nearStaticMv(uv, colorDim));
+
+        if (pc.mode == 4) {
+            float tmpl[64];
+            [[unroll]] for (int i = 0; i < 64; ++i) {
+                const ivec2 p = clamp(center + ivec2(i % 8, i / 8) - 4, ivec2(0), colorDim - 1);
+                tmpl[i] = luma(texelFetch(r_color_tm1, p, 0));
+            }
+            float best = 1e30;
+            ivec2 bestD = seed;
+            for (int pass = 0; pass < (allowExpansion ? 2 : 1); ++pass) {
+                int radius = pc.radius;
+                if (pass == 1) {
+                    if (max(abs(bestD.x - seed.x), abs(bestD.y - seed.y)) < pc.radius && best / 64.0 <= 0.025) break;
+                    radius = min(16, max(4, pc.radius * 2));
+                }
+                for (int dy = -radius; dy <= radius; ++dy) {
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        if (pass == 1 && max(abs(dx), abs(dy)) <= pc.radius) continue;
+                        ivec2 d = seed + ivec2(dx, dy);
+                        if (pass == 1 && (any(lessThan(center - ivec2(4) + d, ivec2(0))) ||
+                           any(greaterThanEqual(center + ivec2(3) + d, colorDim)))) continue;
+                        float sad = 0.0;
+                        [[unroll]] for (int i = 0; i < 64; ++i) {
+                            ivec2 p = clamp(center + ivec2(i % 8, i / 8) - 4 + d, ivec2(0), colorDim - 1);
+                            sad += abs(tmpl[i] - luma(texelFetch(r_color_tp1, p, 0)));
+                        }
+                        sad += 1e-4 * float(abs(dx) + abs(dy));
+                        if (sad < best) { best = sad; bestD = d; }
+                    }
+                }
+            }
+            flow = vec2(bestD) / vec2(colorDim);
+        } else {
+            float tmpl[16];
+            [[unroll]] for (int i = 0; i < 16; ++i) {
+                const ivec2 p = clamp(center + ivec2(i % 4, i / 4) * 2 - 4, ivec2(0), colorDim - 1);
+                tmpl[i] = luma(texelFetch(r_color_tm1, p, 0));
+            }
+            float best = 1e30;
+            ivec2 bestD = seed;
+            for (int pass = 0; pass < (allowExpansion ? 2 : 1); ++pass) {
+                int radius = pc.radius;
+                if (pass == 1) {
+                    if (max(abs(bestD.x - seed.x), abs(bestD.y - seed.y)) < pc.radius && best / 16.0 <= 0.025) break;
+                    radius = min(16, max(4, pc.radius * 2));
+                }
+                for (int dy = -radius; dy <= radius; ++dy) {
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        if (pass == 1 && max(abs(dx), abs(dy)) <= pc.radius) continue;
+                        ivec2 d = seed + ivec2(dx, dy);
+                        if (pass == 1 && (any(lessThan(center - ivec2(4) + d, ivec2(0))) ||
+                           any(greaterThanEqual(center + ivec2(3) + d, colorDim)))) continue;
+                        float sad = 0.0;
+                        [[unroll]] for (int i = 0; i < 16; ++i) {
+                            ivec2 p = clamp(center + ivec2(i % 4, i / 4) * 2 - 4 + d, ivec2(0), colorDim - 1);
+                            sad += abs(tmpl[i] - luma(texelFetch(r_color_tp1, p, 0)));
+                        }
+                        sad += 1e-4 * float(abs(dx) + abs(dy));
+                        if (sad < best) { best = sad; bestD = d; }
+                    }
+                }
+            }
+            flow = vec2(bestD) / vec2(colorDim);
+        }
+    }
+
+                                                                                                                 
+                                                                                                                   
+                                                                                                                   
+    if (hybrid && g_rejReason == 5 && !any(isnan(originalFlow)) && !any(isinf(originalFlow))) {
+        const vec2 uv = (vec2(o) + 0.5) / vec2(flowDim);
+        if (correspondenceError(uv, originalFlow) < 0.7 * correspondenceError(uv, flow)) {
+            flow = originalFlow;
+            if ((pc.useDepth & 256) != 0) atomicAdd(diag.count[16], 1u);                                       
+        }
+    }
+                                                                                                              
+                                                                                                                    
+                                                                
+    vec2 outFlow = flow * vec2(colorDim) * vec2(pc.flowSignX, pc.flowSignY);
+    if (pc.mode == 2) outFlow = vec2(pc.constX, pc.constY);
+    if((pc.useDepth & 256)!=0 && length(outFlow)<=.25)atomicAdd(diag.count[4],1u);
+    imageStore(rw_flow, o, vec4(outFlow, 0.0, 0.0));
+}
+
+

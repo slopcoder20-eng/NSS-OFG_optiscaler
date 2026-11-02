@@ -1,0 +1,115 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_GOOGLE_include_directive : enable
+                                                                                                                            
+#extension GL_NV_cooperative_matrix2 : enable
+#define MLOF2_EPI_REG 1
+                                                                                                                              
+                                                                                                                
+                                                                                                              
+                                                                                                                 
+                                                                                                                     
+                                                                                                                        
+                                    
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 10) const uint DIL = 1u;
+layout(constant_id = 11) const uint P = 2u;                                                            
+layout(constant_id = 12) const uint TR = 2u;                               
+layout(constant_id = 13) const int ACT = 0;
+layout(constant_id = 14) const uint ICW = 4u;                                                          
+layout(constant_id = 15) const uint OC = 16u;
+layout(constant_id = 16) const uint WP = 0u;                              
+layout(constant_id = 17) const uint NB = 1u;                                 
+layout(constant_id = 18) const uint HP = 0u;                      
+layout(constant_id = 19) const uint NSEG = 1u;
+layout(constant_id = 20) const uint SEGW1 = 0xFFFFu;                                                                
+layout(constant_id = 21) const uint SEGW2 = 0xFFFFu;
+layout(constant_id = 22) const uint SEGW3 = 0xFFFFu;
+layout(constant_id = 24) const uint OW = 1u;
+layout(constant_id = 25) const uint OH = 1u;
+layout(constant_id = 26) const uint OBT = 1u;                       
+layout(constant_id = 27) const uint NROW = 1u;
+
+const uint KH = uint(MLOF2_IP0), KW = uint(MLOF2_IP1);
+const uint CB = ICW / 4u;
+
+#include "mlof2_coop_epi.glsl"
+
+                                                                                            
+float epiQBR(const in uint32_t r, const in uint32_t c, const in float x, const in float inv, const in uint32_t x0,
+             const in uint32_t w_, const in uint32_t yok) {
+    return (x0 + c >= w_ || yok == 0u) ? 0.0 : clamp(roundEven(x * inv), -127.0, 127.0);
+}
+
+void main() {
+    Tensor to = outAt();
+    Seg s0 = segAt(0u), s1 = segAt(NSEG > 1u ? 1u : 0u), s2 = segAt(NSEG > 2u ? 2u : 0u), s3 = segAt(NSEG > 3u ? 3u : 0u);
+    const uint NG = OBT / NB, TX = (OW + 15u) / 16u, TY = (OH + TR - 1u) / TR;
+    uint t = gl_WorkGroupID.x;
+    uint g = t % NG; t /= NG;
+    uint tx = t % TX; t /= TX;
+    uint ty = t % TY;
+    uint n = t / TY;
+    uint x0 = tx * 16u, y0 = ty * TR;
+    uint w_off = opw(OP_W_OFF);
+    int res_t = opi(6), res_c = opi(7);
+
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[TR * NB];
+    for (uint u = 0u; u < TR * NB; ++u) acc[u] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    for (uint ky = 0u; ky < KH; ++ky)
+        for (uint kx = 0u; kx < KW; ++kx)
+            for (uint cb = 0u; cb < CB; ++cb) {
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a[NB];
+                for (uint nb = 0u; nb < NB; ++nb)
+                    coopMatLoad(a[nb], blob, w_off + ((((g * NB + nb) * (KH * KW)) + ky * KW + kx) * CB + cb) * 64u, 4u,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                                                                                            
+                const uint cw = cb * 4u;
+                const uint sk = cw >= SEGW3 ? 3u : (cw >= SEGW2 ? 2u : (cw >= SEGW1 ? 1u : 0u));
+                const uint sw0 = sk == 0u ? 0u : (sk == 1u ? SEGW1 : (sk == 2u ? SEGW2 : SEGW3));
+                const uint sw1 = sk + 1u >= NSEG ? ICW : (sk == 0u ? SEGW1 : (sk == 1u ? SEGW2 : SEGW3));
+                uint ib = (sk == 0u ? s0.t.base : (sk == 1u ? s1.t.base : (sk == 2u ? s2.t.base : s3.t.base))) >> 2u;
+                for (uint r = 0u; r < TR; ++r) {
+                    uint iy = y0 + r + P + ky * DIL - (KH / 2u) * DIL, ix = x0 + P + kx * DIL - (KW / 2u) * DIL;
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+                    coopMatLoad(b, arena_u32, ib + ((((n * ((sw1 - sw0) / 4u) + (cw - sw0) / 4u) * HP + iy) * WP + ix) << 2u), 4u,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    for (uint nb = 0u; nb < NB; ++nb) acc[r * NB + nb] = coopMatMulAdd(a[nb], b, acc[r * NB + nb]);
+                }
+            }
+
+    uint so = opw(OP_SCALE_OFF), bo = opw(OP_BIAS_OFF), ob_ = to.base >> 2u;
+    float inv = 1.0 / to.scale;
+    uint rb_ = 0u; float rscale = 0.0;
+    if (res_t >= 0) { Tensor rt = tensorAt(uint(res_t)); rb_ = rt.base >> 2u; rscale = rt.scale; }
+    for (uint r = 0u; r < TR; ++r)
+        for (uint nb = 0u; nb < NB; ++nb) {
+            uint ob = g * NB + nb, y = y0 + r;
+            uint yok = y < OH ? 1u : 0u;
+            uint off = ((((n * OBT + ob) * HP + y + P) * WP + x0 + P) << 2u);                                        
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sc, bi, yf, ya, qf;
+            coopMatLoad(sc, blob, so + ob * 16u, 0u, gl_CooperativeMatrixLayoutColumnMajor);                                 
+            coopMatLoad(bi, blob, bo + ob * 16u, 0u, gl_CooperativeMatrixLayoutColumnMajor);
+            yf = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(acc[r * NB + nb]) * sc + bi;
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> rr = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            if (res_t >= 0) {
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> r8;
+                coopMatLoad(r8, arena_u32, rb_ + off, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+                rr = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(r8) * rscale;
+            }
+            if (res_t >= 0 && res_c < 0) yf = yf + rr;                                              
+            coopMatPerElementNV(ya, yf, epiAct, ACT);
+            if (res_t >= 0 && res_c >= 0) ya = ya + rr;
+            coopMatPerElementNV(qf, ya, epiQBR, inv, x0, OW, yok);
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> q8 = coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(qf);
+            coopMatStore(q8, arena_u32, ob_ + off, 4u, gl_CooperativeMatrixLayoutColumnMajor);                                
+        }
+}

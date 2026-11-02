@@ -1,0 +1,268 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+// Workgroup = exactly one subgroup (32 on wave32, 64 on wave64): coopmat ops need every lane of the subgroup.
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint kSubgroupSize = 32;
+layout(constant_id = 2) const uint kAblate = 0;   // profiling bitmask: 1 = no global input loads, 2 = no MMA, 4 = raw accumulator store instead of the epilogue, 8 = weights loaded once
+
+// Push Constants (52 bytes)
+layout(push_constant) uniform PushConstants {
+    uint in_width;
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint in_channels;
+    uint out_channels;
+    int pad_y;
+    int pad_x;
+    int stride_y;
+    int stride_x;
+    int out_zp;
+    int has_table;
+    uint in1_channels; // 0 for single-input, 16 for dual-input fused concat
+    uint upsample;     // 1: input is read through a fused nearest 2x upsample (source is in_width/2 x in_height/2)
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uvec4 in_data[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uint out_data[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer WeightBuffer {
+    int8_t weight_data[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer WeightWordBuffer {
+    uint weight_words[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer BiasBuffer {
+    int32_t bias_data[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer MultiplierBuffer {
+    int32_t multiplier_data[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer ShiftBuffer {
+    int32_t shift_data[];
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer TableBuffer {
+    int8_t table_data[];
+};
+
+layout(std430, set = 0, binding = 7) readonly buffer InputBuffer2 {
+    uvec4 in_data2[];
+};
+
+// Same memory as in_data, seen as scalar words: the 12-channel first layer has 12-byte pixels (3 words).
+layout(std430, set = 0, binding = 0) readonly buffer InputBufferWords {
+    uint in_words[];
+};
+
+uint inWord(uint w)  { return in_words[w]; }
+
+// One input pixel's 16-channel group `ic_t` (handles the 12-channel input, fused concat and fused 2x upsample).
+uvec4 loadInPixel(uint y, uint x, uint ic_t, uint ic_tiles) {
+    uint p_in = (pc.upsample != 0u) ? ((y >> 1) * (pc.in_width >> 1) + (x >> 1)) : (y * pc.in_width + x);
+    if (pc.in_channels == 12u) {
+        uint b = p_in * 3u;
+        return uvec4(inWord(b), inWord(b + 1u), inWord(b + 2u), 0u);
+    }
+    if (pc.in1_channels > 0u)
+        return (ic_t == 0u) ? in_data[p_in] : in_data2[p_in * 2u + (ic_t - 1u)];
+    return in_data[p_in * ic_tiles + ic_t];
+}
+
+// A subgroup computes a 16x4 pixel block (4 pixel tiles = 4 consecutive rows, 16 columns each) x OCT output-channel tiles.
+// Any output width works: columns >= out_width and rows >= out_height are masked. Weights (matB) are shared by the
+// PT pixel tiles, the staged input rows (matA) by the OCT channel tiles.
+#define PT 4
+#define OCT 2
+#define TW 16
+#define NPMAX (15 * 2 + 3)      // input pixels needed per tile row (stride 2 worst case)
+
+shared uvec4   lds_row[PT * NPMAX];       // sliding window: one input row segment per tile row
+shared int32_t lds_tile_c[PT * OCT * 256]; // v19: all PT*OCT accumulator tiles at once (was one tile at a time,
+                                           // re-storing PT*OCT=8 times with a barrier pair around each -> 32 runtime
+                                           // barriers in the epilogue). +7KiB LDS, well within budget for a
+                                           // one-subgroup workgroup; lets all 8 coopMatStore calls issue back to
+                                           // back and the whole requantize pass run behind a single barrier pair.
+shared int32_t lds_bias[16 * OCT];
+shared int32_t lds_mult[16 * OCT];
+shared int32_t lds_shift[16 * OCT];
+
+void main() {
+    const uint oct_base = gl_WorkGroupID.y * OCT;          // first output-channel tile of this workgroup
+    const uint lane_id  = gl_SubgroupInvocationID;
+    const uint SG = kSubgroupSize;
+
+    const uint nbx = (pc.out_width + TW - 1u) / TW;
+    const uint bx  = gl_WorkGroupID.x % nbx;
+    const uint by  = gl_WorkGroupID.x / nbx;
+    const uint x0  = bx * TW;
+    const uint y0  = by * PT;
+
+    const uint ic_tiles = (pc.in_channels + 15) / 16;
+    const uint oc_tiles = (pc.out_channels + 15) / 16;
+
+    for (uint i = lane_id; i < 16u * OCT; i += SG) {
+        uint cur_oc = oct_base * 16u + i;
+        if (cur_oc < pc.out_channels) {
+            lds_bias[i]  = bias_data[cur_oc];
+            lds_mult[i]  = multiplier_data[cur_oc];
+            lds_shift[i] = shift_data[cur_oc];
+        } else {
+            lds_bias[i]  = 0;
+            lds_mult[i]  = 0;
+            lds_shift[i] = 0;
+        }
+    }
+
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC[PT * OCT];
+    for (uint i = 0; i < PT * OCT; ++i)
+        matC[i] = coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    const bool oc1_valid = (oct_base + 1u) < oc_tiles;     // second channel tile exists (uniform)
+
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    const uint sx = uint(pc.stride_x);
+    const uint NP = (TW - 1u) * sx + 3u;
+    // Per-lane staging slots: which (tile row, column) each lane loads never changes across the ky / ic loops,
+    // so resolve the division, column bounds and row base once instead of in every staging phase.
+    const uint NSLOT = (PT * NPMAX + kSubgroupSize - 1u) / kSubgroupSize;
+    int  st_rowbase[NSLOT];
+    int  st_x[NSLOT];
+    uint st_dst[NSLOT];
+    bool st_live[NSLOT];                               // slot addresses a valid LDS row and output row
+    [[unroll]] for (uint sl = 0; sl < NSLOT; ++sl) {
+        const uint j  = lane_id + sl * SG;
+        const bool inr = j < PT * NP;
+        const uint t  = inr ? j / NP : 0u;
+        const uint jj = inr ? j - t * NP : 0u;
+        st_live[sl]    = inr && ((y0 + t) < pc.out_height) && (int(x0 * sx) - pc.pad_x + int(jj) >= 0)
+                         && (int(x0 * sx) - pc.pad_x + int(jj) < int(pc.in_width));
+        st_rowbase[sl] = int(y0 + t) * pc.stride_y - pc.pad_y;
+        st_x[sl]       = int(x0 * sx) - pc.pad_x + int(jj);
+        st_dst[sl]     = inr ? (t * NP + jj) : 0u;
+    }
+    for (int ky = 0; ky < 3; ++ky) {
+        for (uint ic_t = 0; ic_t < ic_tiles; ++ic_t) {
+            [[unroll]] for (uint sl = 0; sl < NSLOT; ++sl) {
+                const uint j = lane_id + sl * SG;
+                if (j < PT * NP) {
+                    const int iy = st_rowbase[sl] + ky;
+                    uvec4 v = uvec4(0x80808080u);
+                    if ((kAblate & 1u) != 0u) v = uvec4(0x01020304u + j);
+                    else if (st_live[sl] && iy >= 0 && iy < int(pc.in_height))
+                        v = loadInPixel(uint(iy), uint(st_x[sl]), ic_t, ic_tiles);
+                    lds_row[st_dst[sl]] = v;
+                }
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+
+            for (int kx = 0; kx < 3; ++kx) {
+                uint wbase = ((kAblate & 8u) != 0u) ? oct_base * 256u : (((ky * 3 + kx) * ic_tiles + ic_t) * oc_tiles + oct_base) * 256u;
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB0;
+                coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB1;
+                coopMatLoad(matB0, weight_words, wbase >> 2, 4, gl_CooperativeMatrixLayoutRowMajor);
+                if (oc1_valid)
+                    coopMatLoad(matB1, weight_words, (wbase + 256u) >> 2, 4, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint t = 0; t < PT; ++t) {
+                    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+                    coopMatLoad(matA, lds_row, t * NP + uint(kx), sx, gl_CooperativeMatrixLayoutRowMajor);
+                    if ((kAblate & 2u) == 0u) {
+                    matC[t * OCT + 0] = coopMatMulAdd(matA, matB0, matC[t * OCT + 0]);
+                    if (oc1_valid)
+                        matC[t * OCT + 1] = coopMatMulAdd(matA, matB1, matC[t * OCT + 1]);
+                    }
+                }
+            }
+            subgroupBarrier();
+            subgroupMemoryBarrierShared();
+        }
+    }
+
+    // ---- epilogue ----
+    if ((kAblate & 4u) != 0u) {
+        // profiling only: raw accumulator dump, one tile at a time (correctness/ISA comparison, not perf-relevant)
+        for (uint o = 0; o < OCT; ++o) {
+            const uint tile_oc = (oct_base + o) * 16u;
+            if (tile_oc >= pc.out_channels) break;
+            for (uint t = 0; t < PT; ++t) {
+                if (y0 + t >= pc.out_height) break;
+                coopMatStore(matC[t * OCT + o], lds_tile_c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+                subgroupBarrier();
+                if (lane_id < 16u) out_data[(y0 + t) * pc.out_width + x0 + lane_id + o * 8u] = uint(lds_tile_c[lane_id * 16u]);
+                subgroupBarrier();
+            }
+        }
+        return;
+    }
+
+    // v19: accumulators -> LDS -> requantize -> packed dword stores, but every (channel tile, pixel tile) accumulator
+    // is stored to its OWN region of lds_tile_c first (no barrier needed between independent coopMatStore calls),
+    // then the whole batch is requantized behind a single barrier pair -- was one barrier pair PER tile (up to 8).
+    for (uint o = 0; o < OCT; ++o) {
+        const uint tile_oc = (oct_base + o) * 16u;
+        if (tile_oc >= pc.out_channels) break;
+        for (uint t = 0; t < PT; ++t) {
+            if (y0 + t >= pc.out_height) break;                 // uniform
+            coopMatStore(matC[t * OCT + o], lds_tile_c, (t * OCT + o) * 256u, 16, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+    subgroupBarrier();
+    subgroupMemoryBarrierShared();
+
+    for (uint o = 0; o < OCT; ++o) {
+        const uint tile_oc = (oct_base + o) * 16u;
+        if (tile_oc >= pc.out_channels) break;
+        const uint valid_oc = min(pc.out_channels - tile_oc, 16u);
+
+        for (uint t = 0; t < PT; ++t) {
+            if (y0 + t >= pc.out_height) break;                 // uniform
+            const uint tile_base = (t * OCT + o) * 256u;
+
+            for (uint it = lane_id; it < 64u; it += SG) {
+                uint rr = it >> 2;          // pixel column within the tile
+                uint w  = it & 3u;          // output word (4 channels)
+                uint ox = x0 + rr;
+                if (ox >= pc.out_width || w * 4u >= valid_oc) continue;
+                uint p  = (y0 + t) * pc.out_width + ox;
+
+                uint out_base_u32 = p * (pc.out_channels / 4) + (tile_oc / 4) + w;
+                uint packed_word = 0u;
+                for (uint j = 0; j < 4u; ++j) {
+                    uint c = w * 4u + j;
+                    if (c >= valid_oc) break;
+                    int32_t acc = lds_tile_c[tile_base + rr * 16u + c] + lds_bias[o * 16u + c];
+                    int32_t shift = lds_shift[o * 16u + c];
+                    // Every rescale shift in both NSS networks is >= 35, so (acc*mult + 2^(shift-1)) >> shift
+                    // only needs the upper 32 bits of the product (identical to the 64-bit form).
+                    int32_t hi, lo;
+                    imulExtended(acc, lds_mult[o * 16u + c], hi, lo);
+                    int32_t val = ((hi + (1 << (shift - 33))) >> (shift - 32)) + pc.out_zp;
+                    int8_t clamped = int8_t(clamp(val, -128, 127));
+                    if (pc.has_table != 0) clamped = table_data[uint(int(clamped) + 128)];
+                    packed_word |= (uint(clamped) & 0xFFu) << (8u * j);
+                }
+                out_data[out_base_u32] = packed_word;
+            }
+        }
+    }
+}

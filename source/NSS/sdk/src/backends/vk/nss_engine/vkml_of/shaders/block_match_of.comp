@@ -1,0 +1,126 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2023-2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * AMD-tuned rewrite of the VKML block_match_of.comp (same bindings, spec constants and push constants).
+ * The original re-sampled both images for every tap of every search position (2 x 25 x 49 texture reads per
+ * pixel). Here a workgroup loads its template and search tiles into shared memory once, keeps the 5x5 template
+ * in registers and accumulates an exact integer SAD (the inputs are R8_UNORM, so values are k/255).
+ * Differences from the original: the SAD is exact instead of a float16 sum (float16 has a 1/64 step above 16, so
+ * the original could tie or swap near-equal candidates); ties keep the earlier spiral candidate in both.
+ * Out-of-image taps read 0 like the original CLAMP_TO_BORDER sampler (transparent black).
+ */
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#define MAX_SEARCH_RANGE (3)
+#define MACRO_BLOCK (5)
+#define MAX_SEARCH_W (MAX_SEARCH_RANGE * 2 + 1)
+#define BLOCK_R (MACRO_BLOCK / 2)
+
+                                                                                                       
+const int SEARCH_ORDER[MAX_SEARCH_W * MAX_SEARCH_W] = {
+    24, 30, 31, 32, 25, 18, 17, 16, 23,
+    36, 37, 38, 39, 40, 33, 26, 19, 12, 11, 10, 9, 8, 15, 22, 29,
+    42, 43, 44, 45, 46, 47, 48, 41, 34, 27, 20, 13, 6, 5, 4, 3, 2, 1, 0, 7, 14, 21, 28, 35
+};
+
+#define MIN_SAD (0)
+#define MIN_SAD_COST (1)
+#define RAW_SAD (2)
+
+layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
+layout(constant_id = 2) const int VECTORIZE_X = 1;
+layout(constant_id = 3) const int VECTORIZE_Y = 1;
+layout(constant_id = 4) const int SEARCH_MODE = MIN_SAD;
+layout(constant_id = 5) const int SEARCH_RANGE = 1;
+layout(constant_id = 6) const int OUTPUT_SIZE_X = 480;
+layout(constant_id = 7) const int OUTPUT_SIZE_Y = 270;
+layout(constant_id = 8) const uint STRIDE_DST_FLOW = 480;
+layout(constant_id = 9) const uint STRIDE_DST_COST = 480;
+layout(constant_id = 10) const bool COST_IMAGE_STORE = false;
+
+layout (binding = 0) uniform sampler2D imageTemplateSampler;
+layout (binding = 1) uniform sampler2D imageSearchSampler;
+layout (set = 0, binding = 2, std430) buffer _dst_flow_buf { i8vec2 dst_flow_buf[]; };
+layout (set = 0, binding = 3, r16ui) uniform writeonly uimage2D dst_cost_img;
+layout (set = 0, binding = 4, std430) buffer _dst_cost_buf { uint16_t dst_cost_buf[]; };
+layout (push_constant) uniform PushConstants { int search_index_limit; };
+
+                                                                                               
+#define WG_X 32
+#define WG_Y 8
+#define T_W (WG_X + 2 * BLOCK_R)
+#define T_H (WG_Y + 2 * BLOCK_R)
+#define S_W (T_W + 2 * MAX_SEARCH_RANGE)
+#define S_H (T_H + 2 * MAX_SEARCH_RANGE)
+shared uint tTile[T_H * T_W];
+shared uint sTile[S_H * S_W];
+
+uint loadTexel(sampler2D s, ivec2 p, ivec2 size)
+{
+    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, size))) return 0u;
+    return uint(texelFetch(s, p, 0).x * 255.0 + 0.5);
+}
+
+void main()
+{
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * ivec2(WG_X, WG_Y);
+    const uint lid = gl_LocalInvocationIndex;
+    const uint threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y;
+    const ivec2 tSize = textureSize(imageTemplateSampler, 0);
+    const ivec2 sSize = textureSize(imageSearchSampler, 0);
+
+    for (uint i = lid; i < T_W * T_H; i += threads) {
+        const ivec2 q = ivec2(int(i % T_W), int(i / T_W));
+        tTile[i] = loadTexel(imageTemplateSampler, origin - BLOCK_R + q, tSize);
+    }
+    for (uint i = lid; i < S_W * S_H; i += threads) {
+        const ivec2 q = ivec2(int(i % S_W), int(i / S_W));
+        sTile[i] = loadTexel(imageSearchSampler, origin - BLOCK_R - MAX_SEARCH_RANGE + q, sSize);
+    }
+    barrier();
+
+    const ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    const ivec2 pos = origin + local;
+    if (any(greaterThanEqual(pos, ivec2(OUTPUT_SIZE_X, OUTPUT_SIZE_Y)))) return;
+
+    uint tmpl[MACRO_BLOCK * MACRO_BLOCK];
+    for (int by = 0; by < MACRO_BLOCK; ++by)
+        for (int bx = 0; bx < MACRO_BLOCK; ++bx)
+            tmpl[by * MACRO_BLOCK + bx] = tTile[(local.y + by) * T_W + local.x + bx];
+
+    uint minDist = 0xFFFFFFFFu;
+    ivec2 flow = ivec2(0);
+    for (int si = 0; si < search_index_limit; ++si) {
+        const int order = SEARCH_ORDER[si];
+        const ivec2 d = ivec2(order % MAX_SEARCH_W, order / MAX_SEARCH_W) - MAX_SEARCH_RANGE;
+        const int base = (local.y + d.y + MAX_SEARCH_RANGE) * S_W + local.x + d.x + MAX_SEARCH_RANGE;
+        uint dist = 0u;
+        for (int by = 0; by < MACRO_BLOCK; ++by)
+            for (int bx = 0; bx < MACRO_BLOCK; ++bx) {
+                const uint s = sTile[base + by * S_W + bx];
+                const uint t = tmpl[by * MACRO_BLOCK + bx];
+                dist += max(s, t) - min(s, t);
+            }
+        if (dist < minDist) {
+            minDist = dist;
+            flow = d;
+        }
+    }
+
+    if (SEARCH_MODE == MIN_SAD || SEARCH_MODE == MIN_SAD_COST) {
+        dst_flow_buf[STRIDE_DST_FLOW * pos.y + pos.x] = i8vec2(flow);
+    }
+    if (SEARCH_MODE == RAW_SAD || SEARCH_MODE == MIN_SAD_COST) {
+        const uint16_t cost = uint16_t(min(minDist, 65535u));
+        if (COST_IMAGE_STORE)
+            imageStore(dst_cost_img, pos, uvec4(cost, 0, 0, 0));
+        else
+            dst_cost_buf[STRIDE_DST_COST * pos.y + pos.x] = cost;
+    }
+}

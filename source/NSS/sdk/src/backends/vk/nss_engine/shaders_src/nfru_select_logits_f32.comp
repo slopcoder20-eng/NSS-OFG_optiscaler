@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+                                                                                                                      
+                                                                                                                 
+                                                                                                                    
+                                                                                                                     
+layout(push_constant) uniform PC { uint w, h, cin; } pc;
+layout(set = 0, binding = 0, std430) readonly buffer In { uint d0[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Out { float lg[]; };
+layout(set = 0, binding = 2, std430) readonly buffer W { float wf[]; };
+void main()
+{
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.w || p.y >= pc.h) return;
+    const uint words = pc.cin / 4u, bofs = 6u * pc.cin * 9u;
+    float acc[6];
+    for (uint o = 0u; o < 6u; ++o) acc[o] = wf[bofs + o];
+    for (int t = 0; t < 9; ++t) {
+        const int x = int(p.x) + t % 3 - 1, y = int(p.y) + t / 3 - 1;
+        if (x < 0 || y < 0 || x >= int(pc.w) || y >= int(pc.h)) continue;
+        const uint base = (uint(y) * pc.w + uint(x)) * words;
+        for (uint wd = 0u; wd < words; ++wd) {
+            const uint v = d0[base + wd];
+            for (uint j = 0u; j < 4u; ++j) {
+                const float u = float(((v >> (8u * j)) & 0xffu) ^ 0x80u);                    
+                if (u == 0.0) continue;
+                const uint c = wd * 4u + j;
+                for (uint o = 0u; o < 6u; ++o) acc[o] += u * wf[(o * pc.cin + c) * 9u + uint(t)];
+            }
+        }
+    }
+    const uint ob = (p.y * pc.w + p.x) * 6u;
+    for (uint o = 0u; o < 6u; ++o) lg[ob + o] = acc[o];
+}

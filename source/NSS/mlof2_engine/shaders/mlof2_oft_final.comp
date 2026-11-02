@@ -1,0 +1,152 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+                                         
+                                                                         
+                                                                        
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+vec3 sampleRGB_Z(Seg s, int y, int x) {
+    if (x < 0 || y < 0 || x >= int(s.t.w) || y >= int(s.t.h)) return vec3(0.0);
+    uint addr = segByteAddr(s, 0u, y, x, 0u);
+    uvec2 w = ldv2(addr >> 3u);
+    vec2 rg = unpackHalf2x16(w.x);
+    float b = unpackHalf2x16(w.y).x;
+    return vec3(rg.x, rg.y, b);
+}
+
+vec3 warpColFast(Seg s, float u, float v) {
+    float x0f = floor(u), y0f = floor(v);
+    float ax = u - x0f, ay = v - y0f;
+    int x0 = int(x0f), y0 = int(y0f);
+    int W = int(s.t.w), H = int(s.t.h);
+
+    if (x0 >= 0 && x0 + 1 < W && y0 >= 0 && y0 + 1 < H) {
+        uint row0 = (s.t.base >> 3u) + uint(y0) * s.t.w;
+        uint row1 = row0 + s.t.w;
+        uvec2 w00 = ldv2(row0 + uint(x0));
+        uvec2 w01 = ldv2(row0 + uint(x0 + 1));
+        uvec2 w10 = ldv2(row1 + uint(x0));
+        uvec2 w11 = ldv2(row1 + uint(x0 + 1));
+
+        vec3 p00 = vec3(unpackHalf2x16(w00.x), unpackHalf2x16(w00.y).x);
+        vec3 p01 = vec3(unpackHalf2x16(w01.x), unpackHalf2x16(w01.y).x);
+        vec3 p10 = vec3(unpackHalf2x16(w10.x), unpackHalf2x16(w10.y).x);
+        vec3 p11 = vec3(unpackHalf2x16(w11.x), unpackHalf2x16(w11.y).x);
+
+        return (1.0 - ay) * ((1.0 - ax) * p00 + ax * p01) +
+               ay * ((1.0 - ax) * p10 + ax * p11);
+    }
+
+    vec3 p00 = sampleRGB_Z(s, y0,     x0);
+    vec3 p01 = sampleRGB_Z(s, y0,     x0 + 1);
+    vec3 p10 = sampleRGB_Z(s, y0 + 1, x0);
+    vec3 p11 = sampleRGB_Z(s, y0 + 1, x0 + 1);
+
+    return (1.0 - ay) * ((1.0 - ax) * p00 + ax * p01) +
+           ay * ((1.0 - ax) * p10 + ax * p11);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                                         
+    uint npix = to.w * to.h;
+    if (gid >= npix) return;
+
+    int oy = int(gid / to.w);
+    int ox = int(gid - uint(oy) * to.w);
+
+    Seg s_ca = segAt(0u);                     
+    Seg s_cb = segAt(1u);                     
+    Seg s_fa = segAt(2u);                       
+    Seg s_fb = segAt(3u);                       
+    Seg s_m  = segAt(4u);                       
+
+    vec2 fa, fb;
+    float m_val;
+
+    if (s_fa.t.w < to.w) {
+                                                                            
+                                                                                               
+        float sx = float(s_fa.t.w) / float(to.w);
+        float sy = float(s_fa.t.h) / float(to.h);
+        float flow_scale = 1.0 / sx;
+        float fx = max((float(ox) + 0.5) * sx - 0.5, 0.0);
+        float fy = max((float(oy) + 0.5) * sy - 0.5, 0.0);
+        int x0 = int(fx);
+        int y0 = int(fy);
+        int x1 = min(x0 + 1, int(s_fa.t.w) - 1);
+        int y1 = min(y0 + 1, int(s_fa.t.h) - 1);
+        float ax = fx - float(x0);
+        float ay = fy - float(y0);
+
+        uint row0_fa = (s_fa.t.base >> 2u) + uint(y0) * s_fa.t.w;
+        uint row1_fa = (s_fa.t.base >> 2u) + uint(y1) * s_fa.t.w;
+        vec2 fa00 = unpackHalf2x16(arena_u32[row0_fa + uint(x0)]);
+        vec2 fa01 = unpackHalf2x16(arena_u32[row0_fa + uint(x1)]);
+        vec2 fa10 = unpackHalf2x16(arena_u32[row1_fa + uint(x0)]);
+        vec2 fa11 = unpackHalf2x16(arena_u32[row1_fa + uint(x1)]);
+        fa = flow_scale * ((1.0 - ay) * ((1.0 - ax) * fa00 + ax * fa01) +
+                                 ay * ((1.0 - ax) * fa10 + ax * fa11));
+
+        uint row0_fb = (s_fb.t.base >> 2u) + uint(y0) * s_fb.t.w;
+        uint row1_fb = (s_fb.t.base >> 2u) + uint(y1) * s_fb.t.w;
+        vec2 fb00 = unpackHalf2x16(arena_u32[row0_fb + uint(x0)]);
+        vec2 fb01 = unpackHalf2x16(arena_u32[row0_fb + uint(x1)]);
+        vec2 fb10 = unpackHalf2x16(arena_u32[row1_fb + uint(x0)]);
+        vec2 fb11 = unpackHalf2x16(arena_u32[row1_fb + uint(x1)]);
+        fb = flow_scale * ((1.0 - ay) * ((1.0 - ax) * fb00 + ax * fb01) +
+                                 ay * ((1.0 - ax) * fb10 + ax * fb11));
+
+        uint row0_m = (s_m.t.base >> 2u) + uint(y0) * s_m.t.w;
+        uint row1_m = (s_m.t.base >> 2u) + uint(y1) * s_m.t.w;
+        float m00 = unpackHalf2x16(arena_u32[row0_m + uint(x0)]).x;
+        float m01 = unpackHalf2x16(arena_u32[row0_m + uint(x1)]).x;
+        float m10 = unpackHalf2x16(arena_u32[row1_m + uint(x0)]).x;
+        float m11 = unpackHalf2x16(arena_u32[row1_m + uint(x1)]).x;
+        m_val = (1.0 - ay) * ((1.0 - ax) * m00 + ax * m01) +
+                      ay * ((1.0 - ax) * m10 + ax * m11);
+    } else {
+        uint addr_fa = segByteAddr(s_fa, 0u, oy, ox, 0u);
+        uint addr_fb = segByteAddr(s_fb, 0u, oy, ox, 0u);
+        fa = unpackHalf2x16(arena_u32[addr_fa >> 2u]);
+        fb = unpackHalf2x16(arena_u32[addr_fb >> 2u]);
+        m_val = segRead(s_m, 0u, oy, ox, 0u);
+    }
+
+    float vis = 1.0 / (1.0 + exp(-m_val));           
+
+                                                                                          
+    float qx_a = float(ox) + fa.x;
+    float qy_a = float(oy) + fa.y;
+    float oa = (qx_a < -0.5 || qx_a > float(to.w) - 0.5 || qy_a < -0.5 || qy_a > float(to.h) - 0.5) ? 1.0 : 0.0;
+
+    float qx_b = float(ox) + fb.x;
+    float qy_b = float(oy) + fb.y;
+    float ob = (qx_b < -0.5 || qx_b > float(to.w) - 0.5 || qy_b < -0.5 || qy_b > float(to.h) - 0.5) ? 1.0 : 0.0;
+
+    float wa_ = vis * (1.0 - oa);
+    float wb_ = (1.0 - vis) * (1.0 - ob);
+    float s = wa_ + wb_;
+    float w_a = (s < 1e-6) ? vis : (wa_ / max(s, 1e-6));
+    float w_b = 1.0 - w_a;
+
+    vec3 col_a = warpColFast(s_ca, qx_a, qy_a);
+    vec3 col_b = warpColFast(s_cb, qx_b, qy_b);
+
+    vec3 col = clamp(w_a * col_a + w_b * col_b, 0.0, 1.0);
+
+                                                    
+    uint addr = tensorByteAddr(to, 0u, oy, ox, 0u);
+    if (to.fmt == 1u) {                                                 
+        uvec2 packed = uvec2(packHalf2x16(col.rg), packHalf2x16(vec2(col.b, 1.0)));
+        stv2(addr >> 3u, packed);
+    } else {                                  
+        arena_u32[addr >> 2u]         = floatBitsToUint(col.r);
+        arena_u32[(addr >> 2u) + 1u]  = floatBitsToUint(col.g);
+        arena_u32[(addr >> 2u) + 2u]  = floatBitsToUint(col.b);
+        arena_u32[(addr >> 2u) + 3u]  = floatBitsToUint(1.0);
+    }
+}

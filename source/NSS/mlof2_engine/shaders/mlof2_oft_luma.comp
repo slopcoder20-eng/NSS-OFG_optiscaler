@@ -1,0 +1,29 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+                                    
+                                                                 
+                                                              
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    Tensor to = tensorAt(opw(OP_OUT));                                                   
+    int W = int(to.w);
+    int H = int(to.h);
+
+    int ox = int(gl_GlobalInvocationID.x);
+    int oy = int(gl_GlobalInvocationID.y);
+    if (ox >= W || oy >= H) return;
+
+    Seg s_col = segAt(0u);
+    uint in_idx = (s_col.t.base >> 3u) + uint(oy) * s_col.t.w + uint(ox);
+    uvec2 w = ldv2(in_idx);
+    vec2 rg = unpackHalf2x16(w.x);
+    float b = unpackHalf2x16(w.y).x;
+    float luma = dot(vec3(rg.x, rg.y, b), vec3(0.299, 0.587, 0.114));
+
+    uint out_idx = (to.base >> 2u) + uint(oy) * to.w + uint(ox);
+    arena_u32[out_idx] = packHalf2x16(vec2(luma, 0.0));
+}

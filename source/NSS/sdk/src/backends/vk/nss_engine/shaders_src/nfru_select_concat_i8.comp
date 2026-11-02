@@ -1,0 +1,36 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+                                                                                                                         
+                                                                                                                          
+                                                                       
+layout(push_constant) uniform PC { uint w, h, w8, h8, bilinear, lw, lh; } pc;                                              
+layout(set = 0, binding = 0, std430) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer O { uint o[]; };
+layout(set = 0, binding = 2, std430) readonly buffer B { uint b[]; };
+void axis(uint dst, uint outSize, uint inSize, out uint i0, out uint i1, out float l)
+{
+    float s = max((float(dst) + 0.5) * (float(inSize) / float(outSize)) - 0.5, 0.0);
+    i0 = min(uint(s), inSize - 1u); i1 = min(i0 + 1u, inSize - 1u); l = s - float(i0);
+}
+float byteU(uint word, uint j) { return float(((word >> (8u * j)) & 0xffu) ^ 0x80u); }                    
+void main()
+{
+    const uint i = gl_GlobalInvocationID.x;                                         
+    if (i >= pc.w * pc.h * 16u) return;
+    const uint px = i >> 4u, word = i & 15u, x = px % pc.w, y = px / pc.w;
+    if (word < 8u) { o[i] = a[px * 8u + word]; return; }
+    if (x >= pc.lw || y >= pc.lh) { o[i] = 0x80808080u; return; }
+    if (pc.bilinear == 0u) { o[i] = b[((y >> 1u) * pc.w8 + (x >> 1u)) * 8u + word - 8u]; return; }
+    uint x0, x1, y0, y1; float lx, ly;
+    axis(x, pc.lw, pc.w8, x0, x1, lx);                                                       
+    axis(y, pc.lh, pc.h8, y0, y1, ly);
+    const uint w00 = b[(y0 * pc.w8 + x0) * 8u + word - 8u], w01 = b[(y0 * pc.w8 + x1) * 8u + word - 8u];
+    const uint w10 = b[(y1 * pc.w8 + x0) * 8u + word - 8u], w11 = b[(y1 * pc.w8 + x1) * 8u + word - 8u];
+    uint packed = 0u;
+    for (uint j = 0u; j < 4u; ++j) {
+        const float v = mix(mix(byteU(w00, j), byteU(w01, j), lx), mix(byteU(w10, j), byteU(w11, j), lx), ly);
+        packed |= ((uint(clamp(floor(v + 0.5), 0.0, 255.0)) ^ 0x80u) & 0xffu) << (8u * j);
+    }
+    o[i] = packed;
+}

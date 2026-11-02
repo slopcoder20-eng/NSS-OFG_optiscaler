@@ -1,0 +1,73 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_GOOGLE_include_directive : enable
+                                                                                      
+                                                                                   
+                                                               
+                                                                 
+#include "mlof2_common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+float readFp16(uint addr) {
+    uint word = arena_u32[addr >> 2u];
+    return unpackHalf2x16(word)[(addr >> 1u) & 1u];
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    Tensor to = tensorAt(opw(OP_OUT));                                     
+    uint npix = to.w * to.h;
+    if (gid >= npix) return;
+
+    uint w_val = to.w;
+    uint u_oy = gid / w_val;
+    uint u_ox = gid - u_oy * w_val;
+
+    uint u_px = u_ox >> 2u;
+    uint u_py = u_oy >> 2u;
+    uint sub_x = u_ox & 3u;
+    uint sub_y = u_oy & 3u;
+    uint sub_idx = (sub_y << 2u) | sub_x;
+
+    Seg s_out80 = segAt(0u);                                  
+    Seg s_fa    = segAt(1u);                                 
+    Seg s_fb    = segAt(2u);                                 
+    Seg s_m     = segAt(3u);                                
+
+                                              
+    uint base_addr = segByteAddr(s_out80, 0u, int(u_py), int(u_px), 0u);
+    vec2 d_ta, d_tb; float d_m;
+    d_ta.x = readFp16(base_addr + (sub_idx << 1u));
+    d_ta.y = readFp16(base_addr + ((16u + sub_idx) << 1u));
+    d_tb.x = readFp16(base_addr + ((32u + sub_idx) << 1u));
+    d_tb.y = readFp16(base_addr + ((48u + sub_idx) << 1u));
+    d_m    = readFp16(base_addr + ((64u + sub_idx) << 1u));
+
+                                                                      
+    uint addr_fa = (s_fa.t.base >> 2u) + u_oy * s_fa.t.w + u_ox;
+    uint addr_fb = (s_fb.t.base >> 2u) + u_oy * s_fb.t.w + u_ox;
+    uint addr_m  = (s_m.t.base >> 2u) + u_oy * s_m.t.w + u_ox;
+
+    vec2 fa_prev = unpackHalf2x16(arena_u32[addr_fa]);
+    vec2 fb_prev = unpackHalf2x16(arena_u32[addr_fb]);
+    float m_prev = unpackHalf2x16(arena_u32[addr_m]).x;
+
+    vec2 f_ta = fa_prev + d_ta;
+    vec2 f_tb = fb_prev + d_tb;
+    float mask = m_prev + d_m;
+
+                               
+    uint addr_ta = (to.base >> 2u) + u_oy * to.w + u_ox;
+    arena_u32[addr_ta] = packHalf2x16(f_ta);
+
+                                                
+    Tensor to_b = tensorAt(opw(OP_IP));
+    uint addr_tb = (to_b.base >> 2u) + u_oy * to_b.w + u_ox;
+    arena_u32[addr_tb] = packHalf2x16(f_tb);
+
+                                               
+    Tensor to_m = tensorAt(opw(OP_IP + 1u));
+    uint addr_tm = (to_m.base >> 2u) + u_oy * to_m.w + u_ox;
+    arena_u32[addr_tm] = packHalf2x16(vec2(mask, 0.0));
+}

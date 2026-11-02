@@ -1,0 +1,129 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+                                                                                                  
+                                                                                             
+                                                                                                
+                                                                                                   
+  
+                                                                                                 
+                                                                                                
+                                                                                              
+                                                                                                
+                                                                                                
+                                                                                                 
+                                                                                                   
+                                                                                                 
+                                                                                    
+                                                                                                  
+                                                                                                 
+                                                                                              
+                                                                                           
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform PostprocessPC {
+    uint render_width;
+    uint render_height;
+    uint display_width;
+    uint display_height;
+    float jitter_x;
+    float jitter_y;
+    float pre_exposure;
+    int reset_history;
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2D s_in_color;
+layout(set = 0, binding = 1) uniform sampler2D s_in_mvec;
+layout(set = 0, binding = 2) uniform sampler2D s_history_color;
+
+layout(std430, set = 0, binding = 3) readonly buffer KpnTensorIn {
+    uint in_kpn[];                                                          
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer FeedbackTensorIn {
+    uint in_feedback[];                                                              
+};
+
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D img_out_color;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D img_history_color;
+
+int unpack_s8(uint word, int lane) {
+    int v = bitfieldExtract(int(word), lane * 8, 8);
+    return v;
+}
+
+void main() {
+    uvec2 dcoord = gl_GlobalInvocationID.xy;
+    if (dcoord.x >= pc.display_width || dcoord.y >= pc.display_height) return;
+
+    vec2 inv_disp = vec2(1.0 / float(pc.display_width), 1.0 / float(pc.display_height));
+    vec2 disp_uv = (vec2(dcoord) + vec2(0.5)) * inv_disp;
+
+                                                     
+    vec2 render_fcoord = disp_uv * vec2(pc.render_width, pc.render_height) - vec2(0.5);
+    ivec2 rcoord = ivec2(round(render_fcoord));
+    rcoord = clamp(rcoord, ivec2(0), ivec2(pc.render_width - 1, pc.render_height - 1));
+
+    vec2 inv_render = vec2(1.0 / float(pc.render_width), 1.0 / float(pc.render_height));
+    vec2 render_uv = (vec2(rcoord) + vec2(0.5)) * inv_render;
+
+                                                    
+    vec2 mvec = texture(s_in_mvec, render_uv).rg;
+    vec2 hist_uv = disp_uv + mvec;
+    vec3 hist_color = (pc.reset_history != 0) ? vec3(0.0) : texture(s_history_color, hist_uv).rgb;
+
+                                                                              
+    uint kpn_w = (pc.render_width + 3) / 4;
+    uint kpn_h = (pc.render_height + 3) / 4;
+    uvec2 kpn_coord = clamp(uvec2(rcoord / 4), uvec2(0), uvec2(kpn_w - 1, kpn_h - 1));
+    uint kpn_tile_idx = kpn_coord.y * kpn_w + kpn_coord.x;
+
+    uint base_kpn_word = kpn_tile_idx * 4;                                                         
+    uint kw[4];
+    kw[0] = in_kpn[base_kpn_word + 0];
+    kw[1] = in_kpn[base_kpn_word + 1];
+    kw[2] = in_kpn[base_kpn_word + 2];
+    kw[3] = in_kpn[base_kpn_word + 3];
+
+    float weights[16];
+    float w_sum = 0.0001;
+    for (int i = 0; i < 16; ++i) {
+        float w = float(unpack_s8(kw[i / 4], i % 4) + 128) / 255.0;
+        weights[i] = w;
+        w_sum += w;
+    }
+    for (int i = 0; i < 16; ++i) {
+        weights[i] /= w_sum;
+    }
+
+                                                            
+                                                                                                
+    vec3 kpn_reconstructed = vec3(0.0);
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            ivec2 tap_coord = clamp(rcoord + ivec2(col - 2, row - 2), ivec2(0), ivec2(pc.render_width - 1, pc.render_height - 1));
+            vec2 tap_uv = (vec2(tap_coord) + vec2(0.5)) * inv_render;
+            vec3 tap_col = texture(s_in_color, tap_uv).rgb;
+            kpn_reconstructed += tap_col * weights[row * 4 + col];
+        }
+    }
+
+                                                                                            
+                                                                                             
+    uint feed_idx = (rcoord.y * pc.render_width + rcoord.x) * 4u;
+    uint feed_word = in_feedback[feed_idx];
+    int feed_alpha_i = unpack_s8(feed_word, 0);               
+    float temporal_weight = clamp(float(feed_alpha_i + 128) / 255.0, 0.05, 0.95);
+
+    if (pc.reset_history != 0) {
+        temporal_weight = 0.0;
+    }
+
+                                                                     
+    vec3 final_color = mix(kpn_reconstructed, hist_color, temporal_weight);
+
+                                                 
+    imageStore(img_out_color, ivec2(dcoord), vec4(final_color, 1.0));
+    imageStore(img_history_color, ivec2(dcoord), vec4(final_color, 1.0));
+}

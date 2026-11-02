@@ -1,0 +1,38 @@
+#version 450
+                                                                                                                       
+                                                                    
+                                                                                     
+                                                                                                                    
+                                                                                                                
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Src { uint d[]; } src;
+layout(set = 0, binding = 1) buffer Dst { uint d[]; } dst;
+
+layout(push_constant) uniform GluePC {
+    uint src_off_w;                                      
+    uint dst_off_w;
+    uint n;                                                 
+    uint mode;
+    uint dstW, dstH, srcStride;            
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    if (pc.mode == 0u) {
+        vec2 v = vec2(uintBitsToFloat(src.d[pc.src_off_w + 2u * i]), uintBitsToFloat(src.d[pc.src_off_w + 2u * i + 1u]));
+        dst.d[pc.dst_off_w + i] = packHalf2x16(v);
+    } else {
+        uint x = i % pc.dstW, y = i / pc.dstW, sw = pc.dstW / 2u, sh = pc.dstH / 2u;
+        float fx = max((float(x) + 0.5) * 0.5 - 0.5, 0.0), fy = max((float(y) + 0.5) * 0.5 - 0.5, 0.0);
+        uint x0 = uint(fx), y0 = uint(fy), x1 = min(x0 + 1u, sw - 1u), y1 = min(y0 + 1u, sh - 1u);
+        float lx = fx - float(x0), ly = fy - float(y0);
+        uint r0 = pc.src_off_w + y0 * pc.srcStride * 2u, r1 = pc.src_off_w + y1 * pc.srcStride * 2u;
+        vec2 a = vec2(uintBitsToFloat(src.d[r0 + 2u * x0]), uintBitsToFloat(src.d[r0 + 2u * x0 + 1u]));
+        vec2 b = vec2(uintBitsToFloat(src.d[r0 + 2u * x1]), uintBitsToFloat(src.d[r0 + 2u * x1 + 1u]));
+        vec2 c = vec2(uintBitsToFloat(src.d[r1 + 2u * x0]), uintBitsToFloat(src.d[r1 + 2u * x0 + 1u]));
+        vec2 d = vec2(uintBitsToFloat(src.d[r1 + 2u * x1]), uintBitsToFloat(src.d[r1 + 2u * x1 + 1u]));
+        dst.d[pc.dst_off_w + i] = packHalf2x16((1.0 - ly) * ((1.0 - lx) * a + lx * b) + ly * ((1.0 - lx) * c + lx * d));
+    }
+}

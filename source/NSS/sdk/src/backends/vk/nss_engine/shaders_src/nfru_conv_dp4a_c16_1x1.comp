@@ -1,0 +1,93 @@
+#version 450
+#ifdef NFRU_DX12
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
+#extension GL_EXT_integer_dot_product : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+
+                                                                                          
+                                                                                              
+                                                                                               
+                                                                                              
+                                                                                                 
+                                                                                                  
+                                                                                                
+                                                               
+  
+                                                                                         
+                                                                            
+layout(local_size_x = 16, local_size_y = 4, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint in_width;
+    uint in_height;
+    uint out_width;
+    uint out_height;
+    uint in_channels;                   
+    uint out_channels;                      
+    int  pad_t;
+    int  pad_l;
+    int  stride_y;
+    int  stride_x;
+    uint kh;
+    uint kw;
+    int  out_zp;
+    int  mult;
+    int  shift;                
+    uint upsample;                  
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer   { uvec4 in_data[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer { uint out_data[]; };
+layout(std430, set = 0, binding = 2) readonly buffer WeightBuffer  { uint weight_data[]; };
+layout(std430, set = 0, binding = 3) readonly buffer BiasBuffer    { int32_t bias_data[]; };
+
+#define DP4A(a, b) dotPacked4x8EXT(int(a), int(b))
+
+void main() {
+                                                                                       
+    const uint ox = gl_WorkGroupID.x * 16u + gl_LocalInvocationID.x;
+    const uint oy = gl_WorkGroupID.y * 4u + gl_LocalInvocationID.y;
+    const bool ok = (ox < pc.out_width) && (oy < pc.out_height);
+
+    const uint ic_tiles = pc.in_channels / 16u;
+    const uint p_in = oy * pc.in_width + ox;                                                               
+
+    int32_t acc[16];
+    [[unroll]] for (uint o = 0; o < 16u; ++o) acc[o] = 0;
+
+    for (uint ic_t = 0u; ic_t < ic_tiles; ++ic_t) {
+        const uvec4 v = ok ? in_data[p_in * ic_tiles + ic_t] : uvec4(0x80808080u);
+        const uint wtile = ic_t * 64u;
+        [[unroll]] for (uint o = 0; o < 16u; ++o) {
+            acc[o] += DP4A(v.x, weight_data[wtile + o])
+                    + DP4A(v.y, weight_data[wtile + o + 16u])
+                    + DP4A(v.z, weight_data[wtile + o + 32u])
+                    + DP4A(v.w, weight_data[wtile + o + 48u]);
+        }
+    }
+
+    if (!ok) return;
+
+    const uint p = oy * pc.out_width + ox;
+                                                                                                         
+    [[unroll]] for (uint w = 0; w < 4u; ++w) {
+        uint packed_word = 0u;
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            const uint o = w * 4u + j;
+            const int32_t a = acc[o] + bias_data[o];
+            int32_t hi, lo;
+            #ifdef NFRU_DX12
+            { const int64_t prod = int64_t(a) * int64_t(pc.mult); hi = int32_t(prod >> 32); lo = int32_t(prod); }                              
+#else
+            imulExtended(a, pc.mult, hi, lo);
+#endif
+            const int32_t val = ((hi + (1 << (pc.shift - 33))) >> (pc.shift - 32)) + pc.out_zp;
+            packed_word |= (uint(clamp(val, -128, 127)) & 0xFFu) << (8u * j);
+        }
+        out_data[p * 4u + w] = packed_word;
+    }
+}

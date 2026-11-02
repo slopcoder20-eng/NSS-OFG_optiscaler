@@ -1,0 +1,148 @@
+/*
+ * SPDX-FileCopyrightText: Copyright 2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+ * SPDX-License-Identifier: MIT
+ */
+#pragma once
+
+                              
+
+                                   
+
+                    
+
+#include <vector>
+#include <string>
+#include <optional>
+
+#include <vulkan/vulkan.h>
+
+                              
+
+namespace arm
+{
+    enum class ModuleType
+    {
+        SHADER,
+        GRAPH
+    };
+
+                                                                 
+       
+                                                                 
+                                                                 
+                                                       
+    struct BufferInfo
+    {
+        uint32_t size;
+    };
+
+                                                          
+       
+                                                                 
+                                                                 
+                                                       
+    struct TensorInfo
+    {
+        std::vector<int64_t> shape;
+        VkFormat             format;
+        bool                 isAliased{false};
+        int64_t              sparsityDimension;
+    };
+
+    struct ConstantsInfo
+    {
+        int                         constantIdx;
+        TensorInfo                  tensorInfo;
+        mlsdk_decoder_constant_data constantData;
+    };
+
+    struct BindingDesc
+    {
+        BindingDesc() = default;
+        BindingDesc(int set, int id)
+            : set(set)
+            , id(id)
+        {
+        }
+
+        int set;
+        int id;
+                            
+        std::optional<int> lod = std::nullopt;
+    };
+
+    struct ResourceInfo
+    {
+        ResourceInfo() = default;
+        ResourceInfo(std::string name, mlsdk_decoder_mrt_category category, int set, int id, int format, mlsdk_decoder_tensor_dimensions dims)
+            : name(std::move(name))
+            , category(category)
+            , set(set)
+            , id(id)
+            , format(format)
+            , dims(std::move(dims))
+        {
+        }
+
+        std::string                     name;
+        mlsdk_decoder_mrt_category      category;
+        int                             set;
+        int                             id;
+        int                             format;
+        mlsdk_decoder_tensor_dimensions dims;
+    };
+
+    struct VgfModule
+    {
+        VgfModule(std::string entryPoint, std::vector<uint8_t> spv, ModuleType type, std::vector<BindingDesc> bindings)
+            : entryPoint(entryPoint)
+            , spv(spv)
+            , type(type)
+            , bindings(bindings)
+        {
+        }
+        VgfModule(std::string entryPoint, std::string moduleName, std::vector<uint32_t> dispatchShape, ModuleType type, std::vector<BindingDesc> bindings)
+            : entryPoint(entryPoint)
+            , moduleName(moduleName)
+            , dispatchShape(dispatchShape)
+            , type(type)
+            , bindings(bindings)
+        {
+        }
+        VgfModule(std::string              entryPoint,
+                  std::string              moduleName,
+                  std::vector<uint8_t>     spv,
+                  std::vector<uint32_t>    dispatchShape,
+                  ModuleType               type,
+                  std::vector<BindingDesc> bindings)
+            : entryPoint(entryPoint)
+            , moduleName(moduleName)
+            , spv(spv)
+            , dispatchShape(dispatchShape)
+            , type(type)
+            , bindings(bindings)
+        {
+        }
+
+        VgfModule() = default;
+
+        std::string                                                      entryPoint;
+        std::string                                                      moduleName;
+        std::vector<uint8_t>                                             spv;
+        std::vector<uint32_t>                                            dispatchShape;
+        std::vector<std::tuple<uint32_t, TensorInfo, std::vector<char>>> constants;
+        ModuleType                                                       type;
+        std::vector<BindingDesc>                                         bindings;
+    };
+
+                                 
+       
+                                                  
+    union Constant
+    {
+        int32_t  i;                                   
+        uint32_t ui;                                    
+        float    f;                                   
+    };
+
+}                  

@@ -1,0 +1,1 @@
+source/NSS/sdk/tools/ffx_shader_compiler/libs/SPIRV-Reflect/CODE_OF_CONDUCT.adoc

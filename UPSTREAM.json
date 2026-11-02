@@ -1,0 +1,10 @@
+{
+  "NSS": {
+    "url": "https://github.com/arm/neural-graphics-sdk-for-game-engines.git",
+    "commit": "aba0d109ffcfb97e380ac0a68fb11683e5561c6e"
+  },
+  "OptiScaler": {
+    "url": "https://github.com/optiscaler/OptiScaler.git",
+    "commit": "aaddda2413f9ef884d5c9a1db2b34e4eb707817f"
+  }
+}
